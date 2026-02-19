@@ -1,0 +1,12 @@
+node_modules/
+dist/
+build/
+.env
+.env.local
+*.db
+*.sqlite
+.DS_Store
+*.log
+.vite/
+backend/astra.db-shm
+backend/astra.db-wal

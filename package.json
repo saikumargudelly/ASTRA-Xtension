@@ -1,0 +1,16 @@
+{
+  "name": "astra-xtension",
+  "version": "0.1.0",
+  "private": true,
+  "description": "ASTRA – Multi-Agent Browser Automation Assistant",
+  "workspaces": [
+    "extension",
+    "backend"
+  ],
+  "scripts": {
+    "dev:ext": "npm run dev --workspace=extension",
+    "dev:backend": "npm run dev --workspace=backend",
+    "build:ext": "npm run build --workspace=extension",
+    "build:backend": "npm run build --workspace=backend"
+  }
+}
