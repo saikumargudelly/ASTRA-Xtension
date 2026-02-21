@@ -40,41 +40,71 @@ export async function analyzeScreen(
 ): Promise<ScreenAnalysis> {
     const systemPrompt = `You are ASTRA's Vision Agent. You analyze browser screenshots to understand page state and identify interactive elements.
 
-Given a screenshot of a web page and a user's query, you must return a JSON object describing:
+Given a screenshot of a web page and a user's query, you must return a TOON object describing:
 1. What TYPE of page this is
 2. What UI ELEMENTS are visible and interactable
+3. Limit the extracted UI elements to a MAXIMUM of 10 items to save tokens.
 3. What ACTION would best fulfill the user's query
 
-Return ONLY valid JSON matching this exact structure:
-{
-  "pageType": "search-engine|content-site|ecommerce|social|news|dashboard|form|generic",
-  "hasSearchBox": true/false,
-  "hasForms": true/false,
-  "mainContentDescription": "brief description of what's on screen",
-  "suggestedAction": "search|extract|scroll|click|fill-form|read",
-  "uiElements": [
-    {
-      "type": "search-input|button|form|list|article|nav|other",
-      "description": "e.g. 'search bar at top with placeholder Search Reddit'",
-      "likelySelector": "e.g. input[placeholder*='Search'], #search, [name='q']"
-    }
-  ],
-  "searchInputHint": "visual description of the search box if found"
-}`;
+OUTPUT FORMAT — TOON only (Token-Oriented Object Notation):
+Do not use JSON formatting. Use this exact line-by-line format:
+pageType: search-engine|content-site|ecommerce|social|news|dashboard|form|generic
+hasSearchBox: true/false
+hasForms: true/false
+mainContentDescription: brief description of what's on screen
+suggestedAction: search|extract|scroll|click|fill-form|read
+searchInputHint: visual description of the search box if found
+
+[UI_ELEMENTS]
+type:search-input | description:search bar at top | likelySelector:#search
+type:button | description:login button | likelySelector:.login-btn
+[/UI_ELEMENTS]`;
 
     try {
         const response = await chatVision(
             systemPrompt,
-            `User wants to: "${userQuery}"\n\nAnalyze this screenshot and return the JSON.`,
+            `User wants to: "${userQuery}"\n\nAnalyze this screenshot and return the TOON output.`,
             screenshot,
         );
 
-        // Parse JSON from response
-        let jsonStr = response.trim();
-        const fenceMatch = jsonStr.match(/```(?:json)?\s*\n?([\s\S]*?)\n?```/);
-        if (fenceMatch) jsonStr = fenceMatch[1].trim();
+        const result: ScreenAnalysis = {
+            pageType: 'generic',
+            hasSearchBox: false,
+            hasForms: false,
+            mainContentDescription: '',
+            suggestedAction: 'search',
+            uiElements: [],
+        };
 
-        return JSON.parse(jsonStr) as ScreenAnalysis;
+        const lines = response.split('\n').map(l => l.trim()).filter(Boolean);
+        let inElements = false;
+
+        for (const line of lines) {
+            if (line.toUpperCase() === '[UI_ELEMENTS]') { inElements = true; continue; }
+            if (line.toUpperCase() === '[/UI_ELEMENTS]') { inElements = false; continue; }
+
+            if (inElements) {
+                const parts = line.split('|').map(p => p.trim());
+                let type: any = 'other', desc = '', sel = '';
+                for (const p of parts) {
+                    if (p.toLowerCase().startsWith('type:')) type = p.substring(5).trim();
+                    else if (p.toLowerCase().startsWith('description:')) desc = p.substring(12).trim();
+                    else if (p.toLowerCase().startsWith('likelyselector:')) sel = p.substring(15).trim();
+                }
+                if (desc) {
+                    result.uiElements.push({ type, description: desc, likelySelector: sel || undefined });
+                }
+            } else {
+                if (line.toLowerCase().startsWith('pagetype:')) result.pageType = line.substring(9).trim() as any;
+                else if (line.toLowerCase().startsWith('hassearchbox:')) result.hasSearchBox = line.substring(13).trim().toLowerCase() === 'true';
+                else if (line.toLowerCase().startsWith('hasforms:')) result.hasForms = line.substring(9).trim().toLowerCase() === 'true';
+                else if (line.toLowerCase().startsWith('maincontentdescription:')) result.mainContentDescription = line.substring(23).trim();
+                else if (line.toLowerCase().startsWith('suggestedaction:')) result.suggestedAction = line.substring(16).trim() as any;
+                else if (line.toLowerCase().startsWith('searchinputhint:')) result.searchInputHint = line.substring(16).trim();
+            }
+        }
+
+        return result;
     } catch {
         // Return honest fallback — don't pretend we know the page state
         return {
@@ -108,33 +138,49 @@ Your task:
 2. Rank them by: RELEVANCE to the query AND POPULARITY (scores, upvotes, reviews, engagement)
 3. Return the top 8 results in structured format
 
-Return ONLY valid JSON:
-{
-  "summary": "2-3 sentence overview of results",
-  "topResults": [
-    {
-      "title": "result title",
-      "description": "snippet or description",
-      "url": "url if visible",
-      "score": "upvotes/score/rating if visible",
-      "rank": 1
-    }
-  ],
-  "totalResultsFound": estimated number of visible results
-}`;
+OUTPUT FORMAT — TOON only (Token-Oriented Object Notation):
+Do not use JSON formatting. Use this exact line-by-line format:
+summary: 2-3 sentence overview of results
+totalResultsFound: estimated number of visible results
+
+[TOP_RESULTS]
+rank:1 | title:result title | description:snippet or description | url:url if visible | score:upvotes/score/rating if visible
+[/TOP_RESULTS]`;
 
         try {
             const response = await chatVision(
                 systemPrompt,
-                `Analyze search results for: "${originalQuery}"`,
+                `Analyze search results for: "${originalQuery}". Return TOON output.`,
                 screenshot,
             );
 
-            let jsonStr = response.trim();
-            const fenceMatch = jsonStr.match(/```(?:json)?\s*\n?([\s\S]*?)\n?```/);
-            if (fenceMatch) jsonStr = fenceMatch[1].trim();
+            const result: ResultsAnalysis = { summary: '', topResults: [], totalResultsFound: 0 };
+            const lines = response.split('\n').map(l => l.trim()).filter(Boolean);
+            let inResults = false;
 
-            return JSON.parse(jsonStr) as ResultsAnalysis;
+            for (const line of lines) {
+                if (line.toUpperCase() === '[TOP_RESULTS]') { inResults = true; continue; }
+                if (line.toUpperCase() === '[/TOP_RESULTS]') { inResults = false; continue; }
+
+                if (inResults) {
+                    const parts = line.split('|').map(p => p.trim());
+                    let rank = 0, title = '', desc = '', url = '', score = '';
+                    for (const p of parts) {
+                        if (p.toLowerCase().startsWith('rank:')) rank = parseInt(p.substring(5).trim()) || 0;
+                        else if (p.toLowerCase().startsWith('title:')) title = p.substring(6).trim();
+                        else if (p.toLowerCase().startsWith('description:')) desc = p.substring(12).trim();
+                        else if (p.toLowerCase().startsWith('url:')) url = p.substring(4).trim();
+                        else if (p.toLowerCase().startsWith('score:')) score = p.substring(6).trim();
+                    }
+                    if (title) {
+                        result.topResults.push({ rank, title, description: desc || undefined, url: url || undefined, score: score || undefined });
+                    }
+                } else {
+                    if (line.toLowerCase().startsWith('summary:')) result.summary = line.substring(8).trim();
+                    else if (line.toLowerCase().startsWith('totalresultsfound:')) result.totalResultsFound = parseInt(line.substring(18).trim()) || 0;
+                }
+            }
+            return result;
         } catch (err) {
             console.warn('[ASTRA Vision] Results analysis failed, falling back to text:', err);
         }
@@ -143,15 +189,44 @@ Return ONLY valid JSON:
     // Text-only fallback
     if (pageText) {
         const response = await chat(
-            `You are ASTRA's Results Analyst. The user searched for "${originalQuery}". Analyze the page content, identify results, rank by relevance and popularity. Return JSON: {"summary": "...", "topResults": [{"title":"...","description":"...","url":"...","score":"...","rank":1}], "totalResultsFound": N}`,
-            `Page content:\n${pageText.substring(0, 8000)}`,
+            `You are ASTRA's Results Analyst. The user searched for "${originalQuery}". Analyze the page content, identify results, rank by relevance and popularity.
+OUTPUT FORMAT — TOON only:
+summary: ...
+totalResultsFound: N
+[TOP_RESULTS]
+rank:1 | title:... | description:... | url:... | score:...
+[/TOP_RESULTS]`,
+            `Page content:\n${pageText.substring(0, 2500)}\n\nReturn TOON output.`,
         );
 
         try {
-            let jsonStr = response.trim();
-            const fenceMatch = jsonStr.match(/```(?:json)?\s*\n?([\s\S]*?)\n?```/);
-            if (fenceMatch) jsonStr = fenceMatch[1].trim();
-            return JSON.parse(jsonStr) as ResultsAnalysis;
+            const result: ResultsAnalysis = { summary: '', topResults: [], totalResultsFound: 0 };
+            const lines = response.split('\n').map(l => l.trim()).filter(Boolean);
+            let inResults = false;
+
+            for (const line of lines) {
+                if (line.toUpperCase() === '[TOP_RESULTS]') { inResults = true; continue; }
+                if (line.toUpperCase() === '[/TOP_RESULTS]') { inResults = false; continue; }
+
+                if (inResults) {
+                    const parts = line.split('|').map(p => p.trim());
+                    let rank = 0, title = '', desc = '', url = '', score = '';
+                    for (const p of parts) {
+                        if (p.toLowerCase().startsWith('rank:')) rank = parseInt(p.substring(5).trim()) || 0;
+                        else if (p.toLowerCase().startsWith('title:')) title = p.substring(6).trim();
+                        else if (p.toLowerCase().startsWith('description:')) desc = p.substring(12).trim();
+                        else if (p.toLowerCase().startsWith('url:')) url = p.substring(4).trim();
+                        else if (p.toLowerCase().startsWith('score:')) score = p.substring(6).trim();
+                    }
+                    if (title) {
+                        result.topResults.push({ rank, title, description: desc || undefined, url: url || undefined, score: score || undefined });
+                    }
+                } else {
+                    if (line.toLowerCase().startsWith('summary:')) result.summary = line.substring(8).trim();
+                    else if (line.toLowerCase().startsWith('totalresultsfound:')) result.totalResultsFound = parseInt(line.substring(18).trim()) || 0;
+                }
+            }
+            return result;
         } catch {
             // ignored
         }

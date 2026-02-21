@@ -76,11 +76,9 @@ export async function planIntent(request: IntentRequest): Promise<StepPlan> {
   }
 
   // ─── Vision-Informed Planning ───
-  // Only use the vision model when the query genuinely requires seeing the screen
-  // (e.g., click a button, fill a form). Skip for pure text search/find queries
-  // to avoid the 30B model adding 30+ seconds of latency.
-  const isSearchQuery = /\b(find|search|look for|show|list|get|what are|best|top|compare|price|buy|recommend)\b/i.test(request.prompt);
-  const needsVision = !isSearchQuery && request.screenshot;
+  // ASTRA utilizes a high-speed Vision model to look at the screen 
+  // and intelligently dictate the execution plan based on the visual UI state.
+  const needsVision = !!request.screenshot;
 
   if (needsVision) {
     try {
@@ -105,7 +103,7 @@ export async function planIntent(request: IntentRequest): Promise<StepPlan> {
       }
       if (screenState.uiElements.length > 0) {
         userPrompt += `\n- Visible UI elements:`;
-        screenState.uiElements.forEach(el => {
+        screenState.uiElements.slice(0, 10).forEach(el => {
           userPrompt += `\n  • ${el.type}: "${el.description}"${el.likelySelector ? ` [selector hint: ${el.likelySelector}]` : ''}`;
         });
       }
@@ -115,15 +113,11 @@ export async function planIntent(request: IntentRequest): Promise<StepPlan> {
     } catch (err) {
       console.warn('[ASTRA] Vision analysis skipped:', (err as Error).message);
     }
-  } else if (isSearchQuery) {
-    console.log('[ASTRA] Skipping vision for search query — using text-only planning (fast path)');
   }
-
   // Use standard chat instead of chatJSON to get TOON output
   const { chat } = await import('../services/llm.js');
 
-  // Enforce /no_think tag manually since we aren't using chatJSON
-  const rawResponse = await chat(`/no_think\n${PLANNER_SYSTEM_PROMPT}`, userPrompt);
+  const rawResponse = await chat(PLANNER_SYSTEM_PROMPT, userPrompt);
   console.log('[ASTRA] Planner generated TOON:\n', rawResponse);
 
   // Parse TOON back into the StepPlan JSON structure for the API

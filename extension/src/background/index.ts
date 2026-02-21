@@ -181,6 +181,7 @@ async function handleCommand(message: SubmitCommandMessage) {
 
                     if (filterResponse?.data && filterResponse.data.length > 0) {
                         console.log(`[ASTRA] Found ${filterResponse.data.length} filter elements`);
+                        console.log('[ASTRA] Raw discovered filters sample:', JSON.stringify(filterResponse.data.slice(0, 5), null, 2));
                         sendProgress(4, 6, `Found ${filterResponse.data.length} filters, matching...`, 'running');
 
                         // Send filters + user query to LLM for matching

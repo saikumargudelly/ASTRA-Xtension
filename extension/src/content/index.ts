@@ -102,8 +102,9 @@ function discoverPageFilters(): Array<{
     const seenLabels = new Set<string>();
 
     const addFilter = (f: typeof filters[0]) => {
-        const key = f.label.toLowerCase().trim();
-        if (key.length < 2 || seenLabels.has(key)) return;
+        // Use composite key so different selectors for the same text (e.g. nested checkbox in label) are kept
+        const key = f.label.toLowerCase().trim() + '|' + f.selector;
+        if (f.label.length < 2 || seenLabels.has(key)) return;
         seenLabels.add(key);
         filters.push(f);
     };
@@ -138,6 +139,7 @@ function discoverPageFilters(): Array<{
 
     // Broad keywords for filter/sort detection across websites
     const filterKeywords = /\b(sort|filter|rating|duration|level|price|topic|category|date|language|popular|newest|oldest|relevant|best|hour|hours|all time|this week|this month|this year|today|free|paid|beginner|intermediate|advanced|expert|reviews|stars|enrollment|enroll|delivery|shipping|brand|department|size|color|condition|seller|prime|subscribe|featured|low.to.high|high.to.low|avg|average|customer|ascending|descending|most.recent|top.rated|best.seller|best.match|recommended|new.arrival|video.duration|upload.date|view.count|subcategor|results|refine|narrow|apply|clear.all|show.more|show.less)\b/i;
+    const ignoreKeywords = /out of 5|stars?/i;
 
     // 1. Standard <select> dropdowns
     document.querySelectorAll('select').forEach(sel => {
@@ -163,7 +165,7 @@ function discoverPageFilters(): Array<{
     document.querySelectorAll('[role="listbox"], [role="combobox"], [aria-haspopup="listbox"], [aria-haspopup="true"], [aria-expanded]').forEach(el => {
         if (!isVisible(el as HTMLElement)) return;
         const text = (el.textContent || '').trim();
-        if (text.length < 2 || text.length > 80) return;
+        if (text.length < 2 || text.length > 80 || ignoreKeywords.test(text)) return;
         const selector = generateSelector(el as HTMLElement);
         if (selector) {
             addFilter({
@@ -190,7 +192,7 @@ function discoverPageFilters(): Array<{
         panel.querySelectorAll('a, button, [role="button"], label, [role="checkbox"], [role="radio"], [role="option"]').forEach(item => {
             if (!isVisible(item as HTMLElement)) return;
             const text = (item.textContent || '').trim();
-            if (text.length < 2 || text.length > 70) return;
+            if (text.length < 2 || text.length > 70 || ignoreKeywords.test(text)) return;
             // Skip nav/menu items that aren't filters
             if (text.match(/^(home|about|contact|sign|log|cart|account|help|support)$/i)) return;
             const selector = generateSelector(item as HTMLElement);
@@ -214,7 +216,7 @@ function discoverPageFilters(): Array<{
     document.querySelectorAll('button, a, [role="button"], [role="tab"], [role="option"], [role="menuitem"]').forEach(el => {
         if (!isVisible(el as HTMLElement)) return;
         const text = (el.textContent || '').trim();
-        if (text.length < 2 || text.length > 60) return;
+        if (text.length < 2 || text.length > 60 || ignoreKeywords.test(text)) return;
         if (!filterKeywords.test(text) && !filterKeywords.test(el.getAttribute('aria-label') || '')) return;
         // Skip if already captured in sidebar
         const inSidebar = el.closest('[class*="filter" i], [class*="sidebar" i], [class*="facet" i], [class*="refinement" i], aside');
@@ -237,7 +239,7 @@ function discoverPageFilters(): Array<{
         const input = inp as HTMLInputElement;
         const labelEl = input.labels?.[0] || input.closest('label') || input.parentElement;
         const text = (labelEl?.textContent || '').trim();
-        if (text.length < 2 || text.length > 80) return;
+        if (text.length < 2 || text.length > 80 || ignoreKeywords.test(text)) return;
 
         const selector = generateSelector(inp as HTMLElement);
         if (selector) {
@@ -256,7 +258,7 @@ function discoverPageFilters(): Array<{
         const summary = el.querySelector('summary, [class*="header" i], [class*="title" i]');
         if (!summary) return;
         const text = (summary.textContent || '').trim();
-        if (text.length < 2 || text.length > 60) return;
+        if (text.length < 2 || text.length > 60 || ignoreKeywords.test(text)) return;
         if (filterKeywords.test(text)) {
             const selector = generateSelector(summary as HTMLElement);
             if (selector) {
@@ -274,6 +276,7 @@ function discoverPageFilters(): Array<{
     document.querySelectorAll('[data-filter], [data-sort], [data-value], [data-purpose*="filter"], [data-testid*="filter"], [data-testid*="sort"]').forEach(el => {
         if (!isVisible(el as HTMLElement)) return;
         const text = (el.textContent || '').trim();
+        if (ignoreKeywords.test(text)) return;
         const selector = generateSelector(el as HTMLElement);
         if (selector && text.length > 1 && text.length < 60) {
             addFilter({
@@ -285,7 +288,7 @@ function discoverPageFilters(): Array<{
         }
     });
 
-    return filters.slice(0, 50); // Cap at 50 filter elements
+    return filters.slice(0, 80); // Cap at 80 to prevent LLM token rate limits (Groq 8k TPM limit)
 }
 
 
@@ -987,6 +990,10 @@ if (document.body) {
 }
 
 function isVisible(el: HTMLElement): boolean {
+    // Allow hidden inputs/labels to be clicked by ASTRA if they are in sidebars
+    const isFilterPart = el.tagName === 'INPUT' || el.tagName === 'LABEL';
+    if (isFilterPart) return true;
+
     if (!el.offsetParent && el.tagName !== 'BODY') return false;
     const style = window.getComputedStyle(el);
     if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return false;

@@ -139,9 +139,10 @@ url: ...
 [/RESULTS_TOON]
 
 CRITICAL RULES:
-1. Extract EXACT titles as they appear on the page - do not paraphrase
-2. Only include results that are actually visible in the page content
-3. Rank by combining relevance to query AND popularity metrics
+1. Extract EXACT titles as they appear on the page - do not paraphrase.
+2. DO NOT concatenate the brand name with the product name. If the brand and product name are separate text blocks on the page, ONLY return the exact product name (e.g., if the page says "Puma" and "Men's Sneaker", return ONLY "Men's Sneaker" as the title).
+3. Only include results that are actually visible in the page content
+4. Rank by combining relevance to query AND popularity metrics
 4. The badge should reflect WHY this result is recommended
 5. The reason field should explain the ranking decision`;
 
@@ -258,27 +259,21 @@ function buildPageContext(data: PageAnalysisPayload): string {
             const prefix = '#'.repeat(section.level);
             parts.push(`${prefix} ${section.heading}`);
             if (section.text) {
-                parts.push(section.text.substring(0, 500));
+                parts.push(section.text.substring(0, 200));
             }
             parts.push('');
         }
     }
 
-    // Full text - ONLY include if viewport logic fails/is absent to prevent massive token duplication
-    const hasViewports = data.viewportSnapshots && data.viewportSnapshots.length > 0;
-    if (data.fullText && !hasViewports) {
-        parts.push('═══ FULL PAGE TEXT ═══');
-        parts.push(data.fullText.substring(0, 6000)); // Reduced from 10k
-        parts.push('');
-    }
-
     // Viewport snapshots (text at each scroll position)
+    const hasViewports = data.viewportSnapshots && data.viewportSnapshots.length > 0;
     if (hasViewports) {
         parts.push(`═══ SCROLL ANALYSIS (${data.viewportSnapshots!.length} viewports captured) ═══`);
-        for (let i = 0; i < data.viewportSnapshots!.length; i++) {
-            const snap = data.viewportSnapshots![i];
+        const limitedViewports = data.viewportSnapshots!.slice(0, 6);
+        for (let i = 0; i < limitedViewports.length; i++) {
+            const snap = limitedViewports[i];
             parts.push(`--- Viewport ${i + 1} (scrollY: ${snap.scrollY}px, ${snap.visibleElements} interactive elements) ---`);
-            parts.push(snap.visibleText.substring(0, 800)); // Reduced from 1500
+            parts.push(snap.visibleText.substring(0, 150)); // Reduced from 250
             parts.push('');
         }
     }
@@ -286,10 +281,11 @@ function buildPageContext(data: PageAnalysisPayload): string {
     // Links (Top 12 to reduce navigational noise)
     if (data.links && data.links.length > 0) {
         parts.push(`═══ LINKS (${data.links.length} found) ═══`);
-        const topLinks = data.links.slice(0, 12); // Reduced from 30
+        const topLinks = data.links.slice(0, 6); // Reduced from 12
         for (const link of topLinks) {
             const ext = link.isExternal ? ' [external]' : '';
-            parts.push(`• ${link.text} → ${link.href}${ext}`);
+            const safeHref = link.href.length > 100 ? link.href.substring(0, 100) + '...' : link.href;
+            parts.push(`• ${link.text} → ${safeHref}${ext}`);
         }
         parts.push('');
     }
@@ -326,8 +322,8 @@ function buildPageContext(data: PageAnalysisPayload): string {
     // Images
     if (data.images && data.images.length > 0) {
         parts.push(`═══ IMAGES (${data.images.length} found) ═══`);
-        for (const img of data.images.slice(0, 20)) {
-            parts.push(`  • ${img.alt || '(no alt text)'} — ${img.src}`);
+        for (const img of data.images.slice(0, 10)) {
+            parts.push(`  • ${img.alt || '(no alt text)'}`);
         }
         parts.push('');
     }
@@ -361,9 +357,13 @@ export async function matchFiltersToConstraints(
         return { filtersToApply: [], extractedConstraints: [] };
     }
 
+    // HARD LIMIT: Prevent massive sidebars from destroying token limits
+    availableFilters = availableFilters.slice(0, 40);
+
     const filtersDesc = availableFilters.map((f, i) =>
         `${i + 1}. [${f.type}] "${f.label}" (selector: ${f.selector})${f.currentValue ? ` [current: ${f.currentValue}]` : ''}${f.options ? ` [options: ${f.options.join(', ')}]` : ''}`
     ).join('\n');
+    console.log(`[ASTRA] RAW INBOUND FILTERS (${availableFilters.length} items):\n`, filtersDesc);
 
     const systemPrompt = `You are ASTRA's Filter Intelligence agent. Your job is to analyze a user's search query and decide which page filters/sorts to apply to get the best results.
 
@@ -380,34 +380,60 @@ INSTRUCTIONS:
 5. If the user mentions "free", "paid", price — look for a price filter.
 6. If the user mentions "beginner", "advanced" — look for a level filter.
 7. Only select filters that are CLEARLY relevant. Don't apply filters that don't match the query.
+8. [CRITICAL] If the user specifies a maximum boundary (e.g., "under 2000" or "under 10 hours") and the page offers multiple smaller bracket filters (like "0-500", "500-1000", "1000-2000"), you MUST return ALL of the valid bracket filters that fit within the user's limit, not just the lowest one!
 
-OUTPUT FORMAT — JSON only:
-{
-  "extractedConstraints": ["highest rated", "under 10 hours"],
-  "filtersToApply": [
-    { "selector": "#sort-by-rating", "label": "Sort by Rating", "reason": "User wants highest rated" },
-    { "selector": "[data-filter=\"duration-short\"]", "label": "0-3 Hours", "reason": "User wants short courses" }
-  ]
-}
+OUTPUT FORMAT — TOON only (Token-Oriented Object Notation):
+Do not use JSON formatting (no braces, no quotes around keys).
+Use this exact bracketed section format:
+
+[CONSTRAINTS]
+highest rated
+under 10 hours
+[/CONSTRAINTS]
+[FILTERS]
+selector:#sort-by-rating | label:Sort by Rating | reason:User wants highest rated
+selector:[data-filter="duration-short"] | label:0-3 Hours | reason:User wants short courses
+[/FILTERS]
 
 RULES:
-- Return EMPTY filtersToApply [] if no constraints match any available filter.
+- Return EMPTY sections if no constraints match any available filter.
 - Use the EXACT selector from the available filters list.
-- Maximum 3 filters to avoid over-filtering.
+- Maximum 5 filters to avoid over-filtering.
 - If no constraints are detected in the query, return empty arrays.`;
 
     try {
-        const response = await chat(systemPrompt, 'Analyze the query and return filter selections as JSON.');
+        const response = await chat(systemPrompt, 'Analyze the query and return filter selections in TOON format.');
+        console.log('[ASTRA] Extracted Filters TOON:\n', response);
 
-        // Parse response — expect JSON
-        const jsonMatch = response.match(/\{[\s\S]*\}/);
-        if (jsonMatch) {
-            const parsed = JSON.parse(jsonMatch[0]);
-            return {
-                filtersToApply: Array.isArray(parsed.filtersToApply) ? parsed.filtersToApply.slice(0, 3) : [],
-                extractedConstraints: Array.isArray(parsed.extractedConstraints) ? parsed.extractedConstraints : [],
-            };
+        const extractedConstraints: string[] = [];
+        const filtersToApply: Array<{ selector: string; label: string; reason: string }> = [];
+
+        const constrMatch = response.match(/\[CONSTRAINTS\]([\s\S]*?)\[\/CONSTRAINTS\]/i);
+        if (constrMatch) {
+            extractedConstraints.push(...constrMatch[1].split('\n').map(l => l.trim()).filter(Boolean));
         }
+
+        const filtersMatch = response.match(/\[FILTERS\]([\s\S]*?)\[\/FILTERS\]/i);
+        if (filtersMatch) {
+            const lines = filtersMatch[1].split('\n').map(l => l.trim()).filter(Boolean);
+            for (const line of lines) {
+                const parts = line.split('|').map(p => p.trim());
+                let selector = '', label = '', reason = '';
+                for (const p of parts) {
+                    if (p.toLowerCase().startsWith('selector:')) selector = p.substring(9).trim();
+                    else if (p.toLowerCase().startsWith('label:')) label = p.substring(6).trim();
+                    else if (p.toLowerCase().startsWith('reason:')) reason = p.substring(7).trim();
+                }
+                if (selector && label) {
+                    filtersToApply.push({ selector, label, reason });
+                }
+            }
+        }
+
+        return {
+            filtersToApply: filtersToApply.slice(0, 5),
+            extractedConstraints: extractedConstraints,
+        };
     } catch (err) {
         console.warn('[ASTRA] Filter matching failed:', err);
     }
