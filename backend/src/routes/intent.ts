@@ -25,7 +25,19 @@ export async function intentRoutes(app: FastifyInstance) {
                 return { plan };
             } catch (err) {
                 const message = err instanceof Error ? err.message : 'Planning failed';
-                return reply.status(500).send({ error: message } as unknown as IntentResponse);
+                console.error('[ASTRA] /intent error:', message);
+
+                // Produce a user-friendly message based on the error type
+                let clientMessage = message;
+                if (message.includes('invalid JSON') || message.includes('JSON parse')) {
+                    clientMessage = 'LLM response could not be parsed as JSON. Please retry.';
+                } else if (message.includes('API failed') || message.includes('Fireworks')) {
+                    clientMessage = 'LLM API error — check your QWEN_API_KEY in backend/.env';
+                } else if (message.includes('timed out') || message.includes('AbortError')) {
+                    clientMessage = 'LLM request timed out. The model may be busy — please retry.';
+                }
+
+                return reply.status(500).send({ error: clientMessage } as unknown as IntentResponse);
             }
         },
     );

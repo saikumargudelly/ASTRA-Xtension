@@ -10,7 +10,13 @@ export type MessageType =
     | 'READ_DOM'
     | 'DOM_DATA'
     | 'ANALYZE_PAGE'
-    | 'PAGE_ANALYSIS';
+    | 'PAGE_ANALYSIS'
+    | 'FIND_ELEMENT'
+    | 'HIGHLIGHT_RESULTS'
+    | 'DISCOVER_FILTERS'
+    | 'CLICK_ELEMENT'
+    | 'CONFIG_REQUEST'
+    | 'CONFIG_RESPONSE';
 
 // Popup → Background
 export interface SubmitCommandMessage {
@@ -127,6 +133,15 @@ export interface ClickElementMessage {
     };
 }
 
+// Background → Content Script: Find a page element by description (vision-assisted)
+export interface FindElementMessage {
+    type: 'FIND_ELEMENT';
+    payload: {
+        description: string;
+        elementType?: string;
+    };
+}
+
 // Background → Content Script
 export interface AnalyzePageMessage {
     type: 'ANALYZE_PAGE';
@@ -223,6 +238,77 @@ export interface DOMElement {
     rect?: { top: number; left: number; width: number; height: number };
 }
 
+// ─── Configuration Assistant Types ───
+
+// Popup → Background
+export interface ConfigRequestMessage {
+    type: 'CONFIG_REQUEST';
+    payload: {
+        query: string;
+        context?: {
+            url?: string;
+            title?: string;
+        };
+    };
+}
+
+// Background → Popup
+export interface ConfigResponseMessage {
+    type: 'CONFIG_RESPONSE';
+    payload: {
+        success: boolean;
+        intent: string;
+        application: string;
+        walkthrough?: Walkthrough;
+        alternativeGuides?: Array<{
+            title: string;
+            url: string;
+            source: string;
+        }>;
+        error?: string;
+    };
+}
+
+export interface Walkthrough {
+    id: string;
+    title: string;
+    description: string;
+    application: string;
+    totalSteps: number;
+    estimatedTime?: string;
+    steps: WalkthroughStep[];
+    source: {
+        url: string;
+        name: string;
+    };
+    lastUpdated: string;
+}
+
+export interface WalkthroughStep {
+    stepNumber: number;
+    title: string;
+    instruction: string;
+    tips?: string[];
+    warnings?: string[];
+    estimatedSeconds?: number;
+    screenshot?: string;
+    uiElements?: UIElement[];
+    navigation?: NavigationHint;
+}
+
+export interface UIElement {
+    type: 'button' | 'menu' | 'input' | 'link' | 'tab' | 'dropdown' | 'checkbox' | 'toggle';
+    label: string;
+    location?: string;
+    action?: string;
+}
+
+export interface NavigationHint {
+    path: string[];
+    url?: string;
+    shortcut?: string;
+}
+
 export type ExtensionMessage =
     | SubmitCommandMessage
     | CommandResultMessage
@@ -234,6 +320,9 @@ export type ExtensionMessage =
     | DOMDataMessage
     | AnalyzePageMessage
     | PageAnalysisMessage
+    | FindElementMessage
     | HighlightResultsMessage
     | DiscoverFiltersMessage
-    | ClickElementMessage;
+    | ClickElementMessage
+    | ConfigRequestMessage
+    | ConfigResponseMessage;

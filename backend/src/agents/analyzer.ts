@@ -123,40 +123,93 @@ OUTPUT FORMAT — you MUST return your response in this exact structure:
 ---
 💡 **ASTRA's Take:** [2-sentence synthesis of what the best options are and why]
 
-[RESULTS_JSON]
-[
-  {
-    "rank": 1,
-    "title": "Exact title of the result as shown on page",
-    "url": "URL if visible",
-    "rating": "4.8 stars" or "94% positive" or null,
-    "reviewCount": "12,400 reviews" or null,
-    "snippet": "1-2 sentence description",
-    "reason": "Why ASTRA ranked this #1",
-    "badge": "🏆 Best Match"
-  }
-]
-[/RESULTS_JSON]`;
+[RESULTS_TOON]
+rank: 1
+title: Exact title of the result as shown on page
+url: URL if visible
+rating: 4.8 stars or 94% positive or null
+reviewCount: 12,400 reviews or null
+snippet: 1-2 sentence description
+reason: Why ASTRA ranked this #1
+badge: 🏆 Best Match
+---
+rank: 2
+title: Second result title
+url: ...
+[/RESULTS_TOON]
 
-        const response = await chat(systemPrompt, `Analyze these search results and return ranked list:`);
+CRITICAL RULES:
+1. Extract EXACT titles as they appear on the page - do not paraphrase
+2. Only include results that are actually visible in the page content
+3. Rank by combining relevance to query AND popularity metrics
+4. The badge should reflect WHY this result is recommended
+5. The reason field should explain the ranking decision`;
 
-        // Parse the [RESULTS_JSON] block
+        const response = await chat(systemPrompt, `Analyze these search results and return ranked list:\n\n${pageContext}`);
+        console.log('[ASTRA] Raw LLM text:', response.substring(0, 1000) + '...');
+
+        // Parse the [RESULTS_TOON] block
         let rankedResults: Array<{
             rank: number; title: string; url?: string; snippet?: string;
             rating?: string; reviewCount?: string; reason?: string; badge?: string;
         }> = [];
 
         try {
-            const jsonMatch = response.match(/\[RESULTS_JSON\]([\s\S]*?)\[\/RESULTS_JSON\]/);
-            if (jsonMatch?.[1]) {
-                rankedResults = JSON.parse(jsonMatch[1].trim());
+            const startIndex = response.indexOf('[RESULTS_TOON]');
+            if (startIndex !== -1) {
+                let toonRaw = response.substring(startIndex + 14);
+                const endIndex = toonRaw.indexOf('[/RESULTS_TOON]');
+                if (endIndex !== -1) {
+                    toonRaw = toonRaw.substring(0, endIndex);
+                }
+
+                const lines = toonRaw.trim().split('\n');
+                let currentResult: any = null;
+
+                for (const line of lines) {
+                    const cleanLine = line.trim();
+                    if (!cleanLine || cleanLine === '---') continue;
+
+                    const colonIdx = cleanLine.indexOf(':');
+                    if (colonIdx > 0) {
+                        const key = cleanLine.substring(0, colonIdx).trim();
+                        const val = cleanLine.substring(colonIdx + 1).trim();
+
+                        if (key === 'rank') {
+                            if (currentResult && currentResult.title && currentResult.rank) {
+                                rankedResults.push(currentResult);
+                            }
+                            currentResult = { rank: parseInt(val, 10) || rankedResults.length + 1 };
+                        } else if (currentResult && val && val !== 'null' && val !== 'None') {
+                            currentResult[key] = val;
+                        }
+                    }
+                }
+                if (currentResult && currentResult.title && currentResult.rank) {
+                    rankedResults.push(currentResult);
+                }
             }
         } catch (parseErr) {
-            console.warn('[ASTRA] Failed to parse RESULTS_JSON:', parseErr);
+            console.warn('[ASTRA] Failed to parse RESULTS_TOON:', parseErr);
         }
 
-        // Strip the JSON block from the summary for clean display
-        const summary = response.replace(/\[RESULTS_JSON\][\s\S]*?\[\/RESULTS_JSON\]/g, '').trim();
+        // Strip the TOON block from the summary for clean display
+        let summary = response;
+        const startIndex = response.indexOf('[RESULTS_TOON]');
+        if (startIndex !== -1) {
+            summary = response.substring(0, startIndex).trim();
+        }
+
+        if (!summary && rankedResults.length > 0) {
+            summary = `ASTRA analyzed the page and ranked ${rankedResults.length} relevant results. Check the badges injected directly on the items!`;
+        }
+
+        console.log('[ASTRA] parsed rankedResults count:', rankedResults.length);
+        if (rankedResults.length > 0) {
+            console.log('[ASTRA] first result sample:', rankedResults[0]);
+        }
+
+        // Return results even if JSON parsing failed - the summary still contains useful info
         return { summary, rankedResults };
     }
 
@@ -211,28 +264,29 @@ function buildPageContext(data: PageAnalysisPayload): string {
         }
     }
 
-    // Full text (trimmed, as primary content source)
-    if (data.fullText) {
+    // Full text - ONLY include if viewport logic fails/is absent to prevent massive token duplication
+    const hasViewports = data.viewportSnapshots && data.viewportSnapshots.length > 0;
+    if (data.fullText && !hasViewports) {
         parts.push('═══ FULL PAGE TEXT ═══');
-        parts.push(data.fullText.substring(0, 10000));
+        parts.push(data.fullText.substring(0, 6000)); // Reduced from 10k
         parts.push('');
     }
 
     // Viewport snapshots (text at each scroll position)
-    if (data.viewportSnapshots && data.viewportSnapshots.length > 0) {
-        parts.push(`═══ SCROLL ANALYSIS (${data.viewportSnapshots.length} viewports captured) ═══`);
-        for (let i = 0; i < data.viewportSnapshots.length; i++) {
-            const snap = data.viewportSnapshots[i];
+    if (hasViewports) {
+        parts.push(`═══ SCROLL ANALYSIS (${data.viewportSnapshots!.length} viewports captured) ═══`);
+        for (let i = 0; i < data.viewportSnapshots!.length; i++) {
+            const snap = data.viewportSnapshots![i];
             parts.push(`--- Viewport ${i + 1} (scrollY: ${snap.scrollY}px, ${snap.visibleElements} interactive elements) ---`);
-            parts.push(snap.visibleText.substring(0, 1500));
+            parts.push(snap.visibleText.substring(0, 800)); // Reduced from 1500
             parts.push('');
         }
     }
 
-    // Links
+    // Links (Top 12 to reduce navigational noise)
     if (data.links && data.links.length > 0) {
         parts.push(`═══ LINKS (${data.links.length} found) ═══`);
-        const topLinks = data.links.slice(0, 30);
+        const topLinks = data.links.slice(0, 12); // Reduced from 30
         for (const link of topLinks) {
             const ext = link.isExternal ? ' [external]' : '';
             parts.push(`• ${link.text} → ${link.href}${ext}`);

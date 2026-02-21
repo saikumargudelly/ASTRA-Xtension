@@ -1,0 +1,16 @@
+<!DOCTYPE html>
+<html>
+<body>
+<script>
+async function test() {
+  try {
+    await fetch('http://localhost:3001/intent', { method: 'POST' });
+  } catch(e) {
+    document.body.innerHTML += e.toString() + "<br>";
+    document.body.innerHTML += "isNetwork: " + (e instanceof TypeError && String(e).includes('fetch')) + "<br>";
+  }
+}
+test();
+</script>
+</body>
+</html>

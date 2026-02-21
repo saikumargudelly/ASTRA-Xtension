@@ -6,6 +6,8 @@ import { executeRoutes } from './routes/execute.js';
 import { summarizeRoutes } from './routes/summarize.js';
 import { memoryRoutes } from './routes/memory.js';
 import { analyzeRoutes } from './routes/analyze.js';
+import { configRoutes } from './routes/config.js';
+import { orchestrateRoutes } from './routes/orchestrate.js';
 import { getDb, closeDb } from './db/sqlite.js';
 
 const PORT = Number(process.env.PORT) || 3001;
@@ -45,6 +47,8 @@ async function start() {
     await app.register(summarizeRoutes);
     await app.register(memoryRoutes);
     await app.register(analyzeRoutes);
+    await app.register(configRoutes);
+    await app.register(orchestrateRoutes);
 
     // ─── Initialize Database ───
     getDb();

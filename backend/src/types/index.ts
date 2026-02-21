@@ -3,7 +3,7 @@
 // Agent action step in a plan
 export interface AgentStep {
     id: string;
-    agent: 'browser' | 'summarizer' | 'memory';
+    agent: 'browser' | 'summarizer' | 'memory' | 'config' | 'analyzer' | 'vision';
     action: string;
     params: Record<string, unknown>;
     dependsOn?: string;
@@ -12,7 +12,7 @@ export interface AgentStep {
 // Planner output
 export interface StepPlan {
     intent: string;
-    category: 'browse' | 'research' | 'summarize' | 'memory' | 'composite';
+    category: 'browse' | 'research' | 'summarize' | 'memory' | 'configuration' | 'composite';
     steps: AgentStep[];
     reasoning: string;
 }
@@ -167,4 +167,134 @@ export interface PageAnalysisPayload {
         visibleElements: number;
     }>;
     restricted?: boolean;
+}
+
+// ─── Configuration Assistant Types ───
+
+// Web Search Types
+export interface WebSearchResult {
+    title: string;
+    url: string;
+    snippet: string;
+    source: string;        // Domain name
+    relevanceScore?: number;
+    publishedDate?: string;
+    thumbnail?: string;
+}
+
+export interface WebSearchOptions {
+    maxResults?: number;
+    excludeDomains?: string[];
+    includeDomains?: string[];
+    region?: string;
+    safeSearch?: boolean;
+    timeRange?: 'day' | 'week' | 'month' | 'year';
+}
+
+// Guide Extraction Types
+export interface UIElement {
+    type: 'button' | 'menu' | 'input' | 'link' | 'tab' | 'dropdown' | 'checkbox' | 'toggle';
+    label: string;
+    location?: string;
+    action?: string;
+}
+
+export interface NavigationHint {
+    path: string[];
+    url?: string;
+    shortcut?: string;
+}
+
+export interface ExtractedStep {
+    order: number;
+    title: string;
+    instruction: string;
+    tips?: string[];
+    warnings?: string[];
+    prerequisites?: string[];
+    uiElements?: UIElement[];
+    navigation?: NavigationHint;
+}
+
+export interface ExtractedGuide {
+    id: string;
+    title: string;
+    source: {
+        url: string;
+        name: string;
+        credibility: 'official' | 'community' | 'blog' | 'unknown';
+    };
+    application: string;
+    summary: string;
+    steps: ExtractedStep[];
+    prerequisites?: string[];
+    requirements?: string[];
+    relatedTopics?: string[];
+    difficulty?: 'beginner' | 'intermediate' | 'advanced';
+    estimatedTime?: string;
+    lastVerified?: string;
+}
+
+// Walkthrough Types
+export interface WalkthroughStep {
+    stepNumber: number;
+    title: string;
+    instruction: string;
+    tips?: string[];
+    warnings?: string[];
+    estimatedSeconds?: number;
+    screenshot?: string;
+    uiElements?: UIElement[];
+    navigation?: NavigationHint;
+}
+
+export interface Walkthrough {
+    id: string;
+    title: string;
+    description: string;
+    application: string;
+    totalSteps: number;
+    estimatedTime?: string;
+    steps: WalkthroughStep[];
+    source: {
+        url: string;
+        name: string;
+    };
+    lastUpdated: string;
+}
+
+// Config Endpoint Types
+export interface ConfigRequest {
+    query: string;
+    context?: {
+        url?: string;
+        title?: string;
+    };
+}
+
+export interface ConfigResponse {
+    success: boolean;
+    intent: string;
+    application: string;
+    walkthrough?: Walkthrough;
+    alternativeGuides?: Array<{
+        title: string;
+        url: string;
+        source: string;
+    }>;
+    error?: string;
+}
+
+export interface WalkthroughProgressRequest {
+    walkthroughId: string;
+    currentStep: number;
+    action: 'next' | 'previous' | 'complete';
+}
+
+export interface WalkthroughProgressResponse {
+    success: boolean;
+    currentStep: number;
+    totalSteps: number;
+    step?: WalkthroughStep;
+    isComplete: boolean;
 }

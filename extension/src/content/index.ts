@@ -299,14 +299,21 @@ function highlightResultsOnPage(results: Array<{
     rank: number; title: string; url?: string; snippet?: string;
     rating?: string; reviewCount?: string; reason?: string; badge?: string;
 }>, _query: string) {
-    // Remove old badges
-    clearAstraBadges();
+    try {
+        // Validate input
+        if (!results || !Array.isArray(results) || results.length === 0) {
+            console.log('[ASTRA] No results to highlight');
+            return;
+        }
 
-    // Inject badge styles
-    if (!document.getElementById('astra-badge-styles')) {
-        const style = document.createElement('style');
-        style.id = 'astra-badge-styles';
-        style.textContent = `
+        // Remove old badges
+        clearAstraBadges();
+
+        // Inject badge styles
+        if (!document.getElementById('astra-badge-styles')) {
+            const style = document.createElement('style');
+            style.id = 'astra-badge-styles';
+            style.textContent = `
             .astra-result-badge {
                 position: absolute;
                 z-index: 2147483640;
@@ -364,67 +371,67 @@ function highlightResultsOnPage(results: Array<{
             }
             .astra-result-badge { animation: astra-badge-enter 0.3s cubic-bezier(0.34,1.56,0.64,1) both; }
         `;
-        document.head.appendChild(style);
-    }
-
-    // Find elements and attach badges
-    let attached = 0;
-    for (const result of results.slice(0, 8)) {
-        const el = findElementByTitle(result.title);
-        if (!el) continue;
-
-        // Find nearest card/item container — very broad to work across all sites
-        const cardSelectors = [
-            'li', 'article', 'section',
-            // Udemy
-            '[data-course-id]', '[class*="course-card"]', '[class*="course_card"]',
-            // Amazon
-            '[data-asin]', '[data-component-type="s-search-result"]', '.s-result-item',
-            // YouTube
-            'ytd-video-renderer', 'ytd-rich-item-renderer',
-            // eBay
-            '.s-item', '[class*="s-item"]',
-            // Coursera
-            '[class*="product-card"]',
-            // LinkedIn
-            '[class*="entity-result"]',
-            // Generic patterns
-            '[class*="card" i]', '[class*="result" i]', '[class*="item" i]',
-            '[class*="course" i]', '[class*="product" i]', '[class*="listing" i]',
-            '[class*="row" i]', '[class*="entry" i]',
-        ].join(', ');
-        const parent = el.closest(cardSelectors) as HTMLElement || el.parentElement as HTMLElement;
-        if (!parent) continue;
-
-        const computedPos = getComputedStyle(parent).position;
-        if (computedPos === 'static') parent.style.position = 'relative';
-
-        // Add subtle highlight border to the card
-        const rankIdx = result.rank - 1;
-        if (rankIdx < 3) {
-            parent.style.outline = `2px solid ${BADGE_COLORS[rankIdx]}44`;
-            parent.style.outlineOffset = '2px';
-            parent.style.borderRadius = '8px';
-            parent.style.transition = 'outline 0.3s ease';
+            document.head.appendChild(style);
         }
-        const color = BADGE_COLORS[rankIdx] || '#6366f1';
-        const icon = BADGE_RANK_ICONS[rankIdx] || '✦';
-        const badgeLabel = result.badge || `#${result.rank}`;
 
-        const badge = document.createElement('div');
-        badge.className = 'astra-result-badge';
-        badge.style.cssText = `
+        // Find elements and attach badges
+        let attached = 0;
+        for (const result of results.slice(0, 8)) {
+            const el = findElementByTitle(result.title);
+            if (!el) continue;
+
+            // Find nearest card/item container — very broad to work across all sites
+            const validSelectors = [
+                'li', 'article', 'section',
+                '[data-course-id]', '[class*="course-card"]', '[class*="course_card"]',
+                '[data-asin]', '[data-component-type="s-search-result"]', '.s-result-item',
+                'ytd-video-renderer', 'ytd-rich-item-renderer',
+                '.s-item', '[class*="s-item"]',
+                '[class*="product-card"]',
+                '[class*="entity-result"]',
+                '[class*="card" i]', '[class*="result" i]', '[class*="item" i]',
+                '[class*="course" i]', '[class*="product" i]', '[class*="listing" i]',
+                '[class*="row" i]', '[class*="entry" i]'
+            ];
+
+            // Find closest matching parent safely
+            let parent: HTMLElement | null = null;
+            try {
+                parent = el.closest(validSelectors.join(', ')) as HTMLElement;
+            } catch (e) { /* ignore invalid CSS selector errors */ }
+
+            if (!parent) parent = el.parentElement as HTMLElement;
+            if (!parent) continue;
+
+            const computedPos = getComputedStyle(parent).position;
+            if (computedPos === 'static') parent.style.position = 'relative';
+
+            // Add subtle highlight border to the card
+            const rankIdx = result.rank - 1;
+            if (rankIdx < 3) {
+                parent.style.outline = `2px solid ${BADGE_COLORS[rankIdx]}44`;
+                parent.style.outlineOffset = '2px';
+                parent.style.borderRadius = '8px';
+                parent.style.transition = 'outline 0.3s ease';
+            }
+            const color = BADGE_COLORS[rankIdx] || '#6366f1';
+            const icon = BADGE_RANK_ICONS[rankIdx] || '✦';
+            const badgeLabel = result.badge || `#${result.rank}`;
+
+            const badge = document.createElement('div');
+            badge.className = 'astra-result-badge';
+            badge.style.cssText = `
             background: linear-gradient(135deg, ${color}dd, ${color}99);
             top: 8px; right: 8px;
             animation-delay: ${rankIdx * 80}ms;
         `;
 
-        // Build tooltip content
-        const ratingLine = result.rating ? `<div class="tip-rating">⭐ ${result.rating}${result.reviewCount ? ` · ${result.reviewCount}` : ''}</div>` : '';
-        const snippetLine = result.snippet ? `<div style="margin:4px 0;opacity:0.85">${result.snippet.substring(0, 120)}${result.snippet.length > 120 ? '…' : ''}</div>` : '';
-        const reasonLine = result.reason ? `<div class="tip-reason">✦ ${result.reason}</div>` : '';
+            // Build tooltip content
+            const ratingLine = result.rating ? `<div class="tip-rating">⭐ ${result.rating}${result.reviewCount ? ` · ${result.reviewCount}` : ''}</div>` : '';
+            const snippetLine = result.snippet ? `<div style="margin:4px 0;opacity:0.85">${result.snippet.substring(0, 120)}${result.snippet.length > 120 ? '…' : ''}</div>` : '';
+            const reasonLine = result.reason ? `<div class="tip-reason">✦ ${result.reason}</div>` : '';
 
-        badge.innerHTML = `
+            badge.innerHTML = `
             <span>${icon}</span>
             <span>ASTRA: ${badgeLabel}</span>
             <span class="astra-badge-close" title="Dismiss">✕</span>
@@ -436,34 +443,38 @@ function highlightResultsOnPage(results: Array<{
             </div>
         `;
 
-        // Dismiss on click of ✕
-        badge.querySelector('.astra-badge-close')?.addEventListener('click', (e) => {
-            e.stopPropagation();
-            badge.remove();
-            activeAstraBadges = activeAstraBadges.filter(b => b !== badge);
-        });
+            // Dismiss on click of ✕
+            badge.querySelector('.astra-badge-close')?.addEventListener('click', (e) => {
+                e.stopPropagation();
+                badge.remove();
+                activeAstraBadges = activeAstraBadges.filter(b => b !== badge);
+            });
 
-        parent.appendChild(badge);
-        activeAstraBadges.push(badge);
+            parent.appendChild(badge);
+            activeAstraBadges.push(badge);
 
-        // Scroll to #1 result and move cursor to it
-        if (result.rank === 1) {
-            setTimeout(() => {
-                parent.scrollIntoView({ behavior: 'smooth', block: 'center' });
-                cursorFocusElement(parent, `#1 ASTRA Pick: ${result.title.substring(0, 30)}`);
-                setTimeout(hideCursorFeedback, 3000);
-            }, 500);
+            // Scroll to #1 result and move cursor to it
+            if (result.rank === 1) {
+                setTimeout(() => {
+                    parent.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                    cursorFocusElement(parent, `#1 ASTRA Pick: ${result.title.substring(0, 30)}`);
+                    setTimeout(hideCursorFeedback, 3000);
+                }, 500);
+            }
+            attached++;
         }
-        attached++;
-    }
 
-    // Show toast summary
-    if (attached > 0) {
-        showDebugToast(`✦ ASTRA highlighted ${attached} top results on the page`);
-    }
+        // Show toast summary
+        if (attached > 0) {
+            showDebugToast(`✦ ASTRA highlighted ${attached} top results on the page`);
+        }
 
-    // Auto-clear badges after 30 seconds
-    setTimeout(clearAstraBadges, 30000);
+        // Auto-clear badges after 30 seconds removed per user request
+        // setTimeout(clearAstraBadges, 30000);
+    } catch (err) {
+        console.error('[ASTRA] Error highlighting results:', err);
+        // Don't throw - highlighting is non-critical
+    }
 }
 
 function findElementByTitle(title: string): HTMLElement | null {
@@ -1627,67 +1638,74 @@ async function handleDOMAction(message: ExecuteDOMActionMessage) {
             // 3. Submit (Hardened)
             await sleep(100); // Reduced from 300
 
-            const enterEvent = {
-                key: 'Enter',
-                code: 'Enter',
-                keyCode: 13,
-                which: 13,
-                bubbles: true,
-                cancelable: true,
-                view: window
-            };
+            // ─── CRITICAL: Return success BEFORE triggering navigation ───
+            // The page may navigate after submit, which would unload this script
+            // before we can send the response. Use setTimeout to ensure response
+            // is sent first.
+            setTimeout(() => {
+                const enterEvent = {
+                    key: 'Enter',
+                    code: 'Enter',
+                    keyCode: 13,
+                    which: 13,
+                    bubbles: true,
+                    cancelable: true,
+                    view: window
+                };
 
-            el.dispatchEvent(new KeyboardEvent('keydown', enterEvent));
-            el.dispatchEvent(new KeyboardEvent('keypress', enterEvent));
-            el.dispatchEvent(new KeyboardEvent('keyup', enterEvent));
+                el.dispatchEvent(new KeyboardEvent('keydown', enterEvent));
+                el.dispatchEvent(new KeyboardEvent('keypress', enterEvent));
+                el.dispatchEvent(new KeyboardEvent('keyup', enterEvent));
 
-            // 4. Try form submit if exists
-            if (el.form) {
-                const submitBtn = el.form.querySelector('button[type="submit"], input[type="submit"]');
-                if (submitBtn) {
-                    (submitBtn as HTMLElement).click();
-                } else {
-                    el.form.requestSubmit();
+                // 4. Try form submit if exists
+                if (el.form) {
+                    const submitBtn = el.form.querySelector('button[type="submit"], input[type="submit"]');
+                    if (submitBtn) {
+                        (submitBtn as HTMLElement).click();
+                    } else {
+                        el.form.requestSubmit();
+                    }
                 }
-            }
 
-            // 5. Try site-specific search buttons as extra insurance
-            const searchBtnSelectors = [
-                // Amazon
-                '#nav-search-submit-button', '#nav-search-submit-text',
-                'input[type="submit"][value*="Go"]',
-                // YouTube
-                'button#search-icon-legacy', '#search-icon-legacy',
-                // eBay
-                '#gh-btn',
-                // Generic
-                'button[type="submit"]',
-                'button[aria-label*="search" i]',
-                'button[aria-label*="find" i]',
-                '[class*="search" i] button',
-                '[class*="search" i] [type="submit"]',
-            ];
-            for (const btnSel of searchBtnSelectors) {
-                const btn = document.querySelector(btnSel) as HTMLElement;
-                if (btn && isVisible(btn)) {
-                    btn.click();
-                    break;
+                // 5. Try site-specific search buttons as extra insurance
+                const searchBtnSelectors = [
+                    // Amazon
+                    '#nav-search-submit-button', '#nav-search-submit-text',
+                    'input[type="submit"][value*="Go"]',
+                    // YouTube
+                    'button#search-icon-legacy', '#search-icon-legacy',
+                    // eBay
+                    '#gh-btn',
+                    // Generic
+                    'button[type="submit"]',
+                    'button[aria-label*="search" i]',
+                    'button[aria-label*="find" i]',
+                    '[class*="search" i] button',
+                    '[class*="search" i] [type="submit"]',
+                ];
+                for (const btnSel of searchBtnSelectors) {
+                    const btn = document.querySelector(btnSel) as HTMLElement;
+                    if (btn && isVisible(btn)) {
+                        btn.click();
+                        break;
+                    }
                 }
-            }
 
-            // 6. Nearby sibling button fallback
-            if (!el.form) {
-                const nextBtn = el.nextElementSibling;
-                if (nextBtn && (nextBtn.tagName === 'BUTTON' || nextBtn.getAttribute('role') === 'button')) {
-                    (nextBtn as HTMLElement).click();
+                // 6. Nearby sibling button fallback
+                if (!el.form) {
+                    const nextBtn = el.nextElementSibling;
+                    if (nextBtn && (nextBtn.tagName === 'BUTTON' || nextBtn.getAttribute('role') === 'button')) {
+                        (nextBtn as HTMLElement).click();
+                    }
+                    const prevBtn = el.previousElementSibling;
+                    if (prevBtn && (prevBtn.tagName === 'BUTTON' || prevBtn.getAttribute('role') === 'button')) {
+                        (prevBtn as HTMLElement).click();
+                    }
                 }
-                const prevBtn = el.previousElementSibling;
-                if (prevBtn && (prevBtn.tagName === 'BUTTON' || prevBtn.getAttribute('role') === 'button')) {
-                    (prevBtn as HTMLElement).click();
-                }
-            }
 
-            setTimeout(() => { el.style.outline = ''; }, 1000); // Clear outline sooner
+                setTimeout(() => { el.style.outline = ''; }, 1000); // Clear outline sooner
+            }, 50); // Small delay to ensure response is sent first
+
             return { success: true, data: { searched: value } };
         }
 

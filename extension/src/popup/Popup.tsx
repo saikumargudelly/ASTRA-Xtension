@@ -3,7 +3,10 @@ import type {
     CommandResultMessage,
     CommandProgressMessage,
     CommandErrorMessage,
+    ConfigResponseMessage,
+    Walkthrough as WalkthroughType,
 } from '../types/messages';
+import { WalkthroughComponent } from './Walkthrough';
 
 interface StepProgress {
     step: number;
@@ -12,18 +15,61 @@ interface StepProgress {
     status: 'pending' | 'running' | 'done' | 'error';
 }
 
+type ViewMode = 'input' | 'loading' | 'results' | 'walkthrough';
+
+// ─── Session State Shape (must match background/index.ts) ───
+interface AstraSessionState {
+    status: 'idle' | 'running' | 'done' | 'error';
+    steps: StepProgress[];
+    result?: { success: boolean; data: unknown; summary?: string; rankedResults?: unknown[] };
+    error?: string;
+    startedAt: number;
+}
+
 export function Popup() {
     const [prompt, setPrompt] = useState('');
     const [isLoading, setIsLoading] = useState(false);
     const [steps, setSteps] = useState<StepProgress[]>([]);
     const [result, setResult] = useState<string | null>(null);
     const [error, setError] = useState<string | null>(null);
+    const [viewMode, setViewMode] = useState<ViewMode>('input');
+    const [currentWalkthrough, setCurrentWalkthrough] = useState<WalkthroughType | null>(null);
+    const [alternativeGuides, setAlternativeGuides] = useState<Array<{ title: string; url: string; source: string }>>([]);
     const outputRef = useRef<HTMLDivElement>(null);
 
+    // ─── Restore state from session storage on mount ───
+    // This ensures that if the user closes and reopens the popup while
+    // the background is still processing, they see the current progress.
     useEffect(() => {
-        const listener = (message: CommandResultMessage | CommandProgressMessage | CommandErrorMessage) => {
+        chrome.storage.session.get('astra_state', (items) => {
+            const state: AstraSessionState | undefined = items.astra_state;
+            if (!state || state.status === 'idle') return;
+
+            if (state.status === 'running') {
+                setIsLoading(true);
+                setSteps(state.steps || []);
+                setViewMode('loading');
+            } else if (state.status === 'done' && state.result) {
+                const r = state.result;
+                const summary = r.summary ??
+                    (typeof r.data === 'string' ? r.data : JSON.stringify(r.data, null, 2));
+                setResult(summary);
+                setSteps(state.steps || []);
+                setViewMode('results');
+            } else if (state.status === 'error' && state.error) {
+                setError(state.error);
+                setSteps(state.steps || []);
+                setViewMode('results');
+            }
+        });
+    }, []);
+
+    // ─── Live message listener (for when popup is open during processing) ───
+    useEffect(() => {
+        const listener = (message: CommandResultMessage | CommandProgressMessage | CommandErrorMessage | ConfigResponseMessage) => {
             switch (message.type) {
                 case 'COMMAND_PROGRESS':
+                    setIsLoading(true);
                     setSteps((prev) => {
                         const existing = prev.findIndex((s) => s.step === message.payload.step);
                         if (existing >= 0) {
@@ -43,17 +89,62 @@ export function Popup() {
                             ? message.payload.data
                             : JSON.stringify(message.payload.data, null, 2))
                     );
+                    setViewMode('results');
                     break;
 
                 case 'COMMAND_ERROR':
                     setIsLoading(false);
                     setError(message.payload.message);
+                    setViewMode('results');
+                    break;
+
+                case 'CONFIG_RESPONSE':
+                    setIsLoading(false);
+                    if (message.payload.success && message.payload.walkthrough) {
+                        setCurrentWalkthrough(message.payload.walkthrough);
+                        setAlternativeGuides(message.payload.alternativeGuides || []);
+                        setViewMode('walkthrough');
+                    } else {
+                        setError(message.payload.error || 'Failed to get configuration walkthrough');
+                        setViewMode('results');
+                    }
                     break;
             }
         };
 
         chrome.runtime.onMessage.addListener(listener);
-        return () => chrome.runtime.onMessage.removeListener(listener);
+
+        // Also watch for storage changes from the background (catches missed messages)
+        const storageListener = (changes: { [key: string]: chrome.storage.StorageChange }) => {
+            const stateChange = changes.astra_state;
+            if (!stateChange) return;
+
+            const state: AstraSessionState = stateChange.newValue;
+            if (!state) return;
+
+            if (state.status === 'running') {
+                setIsLoading(true);
+                setSteps(state.steps || []);
+            } else if (state.status === 'done' && state.result) {
+                const r = state.result;
+                const summary = r.summary ??
+                    (typeof r.data === 'string' ? r.data : JSON.stringify(r.data, null, 2));
+                setIsLoading(false);
+                setResult(summary);
+                setViewMode('results');
+            } else if (state.status === 'error' && state.error) {
+                setIsLoading(false);
+                setError(state.error);
+                setViewMode('results');
+            }
+        };
+
+        chrome.storage.session.onChanged.addListener(storageListener);
+
+        return () => {
+            chrome.runtime.onMessage.removeListener(listener);
+            chrome.storage.session.onChanged.removeListener(storageListener);
+        };
     }, []);
 
     useEffect(() => {
@@ -65,10 +156,14 @@ export function Popup() {
     const handleSubmit = () => {
         if (!prompt.trim() || isLoading) return;
 
+        // Clear session state from any prior run
+        chrome.storage.session.remove('astra_state');
+
         setIsLoading(true);
         setSteps([]);
         setResult(null);
         setError(null);
+        setViewMode('loading');
 
         chrome.runtime.sendMessage({
             type: 'SUBMIT_COMMAND',
@@ -101,6 +196,36 @@ export function Popup() {
         }
     };
 
+    const handleCloseWalkthrough = () => {
+        setCurrentWalkthrough(null);
+        setAlternativeGuides([]);
+        setViewMode('input');
+        setPrompt('');
+    };
+
+    const handleReset = () => {
+        chrome.storage.session.remove('astra_state');
+        setIsLoading(false);
+        setSteps([]);
+        setResult(null);
+        setError(null);
+        setPrompt('');
+        setViewMode('input');
+    };
+
+    // Show walkthrough view if we have a walkthrough
+    if (viewMode === 'walkthrough' && currentWalkthrough) {
+        return (
+            <div className="flex flex-col h-full min-h-[520px] bg-astra-bg">
+                <WalkthroughComponent
+                    walkthrough={currentWalkthrough}
+                    alternativeGuides={alternativeGuides}
+                    onClose={handleCloseWalkthrough}
+                />
+            </div>
+        );
+    }
+
     return (
         <div className="flex flex-col h-full min-h-[520px] bg-astra-bg">
             {/* Header */}
@@ -111,10 +236,20 @@ export function Popup() {
                     </div>
                     <div className="absolute -bottom-0.5 -right-0.5 w-2.5 h-2.5 bg-astra-success rounded-full border-2 border-astra-surface" />
                 </div>
-                <div>
+                <div className="flex-1">
                     <h1 className="text-sm font-semibold text-astra-text tracking-wide">ASTRA</h1>
                     <p className="text-[10px] text-astra-text-muted">AI Browser Assistant</p>
                 </div>
+                {/* Reset button — only shown when there is active state */}
+                {(isLoading || result || error) && (
+                    <button
+                        onClick={handleReset}
+                        title="Clear and start over"
+                        className="text-[10px] px-2 py-1 rounded-md text-astra-text-muted hover:text-astra-text hover:bg-astra-surface transition-colors"
+                    >
+                        ✕ Clear
+                    </button>
+                )}
             </header>
 
             {/* Input Section */}
@@ -210,7 +345,7 @@ export function Popup() {
                         </div>
                         <p className="text-sm text-astra-text font-medium mb-1">Ready to assist</p>
                         <p className="text-xs text-astra-text-muted max-w-[240px]">
-                            Type a command like "summarize this page" or "collect Reddit posts from r/technology"
+                            Type a command like &quot;summarize this page&quot; or &quot;find best python courses on Udemy&quot;
                         </p>
                     </div>
                 )}

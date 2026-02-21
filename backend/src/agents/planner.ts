@@ -1,103 +1,70 @@
-import { chatJSON } from '../services/llm.js';
+// Planner using TOON output
 import type { StepPlan, IntentRequest } from '../types/index.js';
 
-const PLANNER_SYSTEM_PROMPT = `You are ASTRA's Planner Agent — a smart research assistant. Given a user's natural language command, create a COMPLETE multi-step execution plan that not only searches but also reads, ranks, and summarizes results.
+// Configuration patterns for early detection
+const CONFIG_PATTERNS = [
+  /how (do i|to|can i) (configure|setup|set up|change|update|modify|enable|disable)/i,
+  /where (is|are|can i find) (the |my )?(settings?|configuration|options?|preferences)/i,
+  /help me (configure|setup|find|change|update)/i,
+  /(enable|disable|turn on|turn off|activate|deactivate) .*(setting|option|feature|mode)/i,
+  /(privacy|security|account|profile|notification) settings?/i,
+  /configure .*(oic|ofsc|oci|oracle|facebook|google|microsoft|aws|azure)/i,
+  /i (want to|need to|would like to) (change|update|configure|modify)/i,
+  /(step[- ]by[- ]step|walkthrough|guide|tutorial) (for|on|to)/i,
+  /(settings?|configuration) (for|in|on) (facebook|oracle|google|microsoft)/i,
+];
 
-Intent categories:
-- browse: Opening URLs, navigating, clicking, searching
-- research: Find + analyze + rank + summarize content (most common for "find", "search", "what are")
-- summarize: Summarizing current page content
-- memory: Storing or retrieving information
-- composite: Multi-category tasks
+const PLANNER_SYSTEM_PROMPT = `You are ASTRA's Planner. Output a TOON (Token-Oriented Object Notation) execution plan.
 
-CRITICAL INSTRUCTIONS:
-1. **NEVER open a new tab just to search**. ALWAYS use 'browser.search' to search in the CURRENT tab. If the user is on udemy.com, search on udemy.com. If on amazon.com, search on amazon.com. EVERY modern website has a search bar.
-2. **SEARCH IN-PLACE ALWAYS**: Use the 'search' action on whatever site the user is currently on. Our smart search handler will find the search box, type the query, and submit it automatically. Never redirect to Google unless explicitly asked.
-3. **ALWAYS DO THE FULL RESEARCH LOOP**: For any "find", "search", "look for" command, ALWAYS generate the full pipeline:
-   - Step 1: search (execute in-place search using the site's own search bar)
-   - Step 2: wait (2500ms for results page to load)
-   - Step 3: analyze_page (read/scrape the results that appeared)
-   The backend will automatically discover and apply filters, rank and summarize results.
-4. **EXTRACT USER CONSTRAINTS**: Pay close attention to constraints in the user's query:
-   - Duration: "under 10 hours", "short", "3-6 hours", "quick course"
-   - Rating: "highest rated", "best", "top rated", "4.5+ stars"
-   - Price: "free", "paid", "under $20", "cheapest"
-   - Level: "beginner", "intermediate", "advanced", "expert"
-   - Date/Recency: "latest", "this week", "this month", "2024", "recent"
-   - Popularity: "most popular", "bestselling", "most enrolled", "trending"
-   Include these constraints in the intent description so the filter system can use them.
-5. **REFINE QUERIES**: Improve the search query but KEEP the core intent (e.g. "best AI courses under 10 hours" → "artificial intelligence machine learning courses"). Do NOT strip constraint keywords.
-6. **ONLY USE BROWSER AGENT**: For ALL search/find/research tasks on ANY website (including reddit.com, youtube.com, amazon.com, etc.), ONLY use the 'browser' agent with 'search' action. NEVER use 'reddit', 'x', or other scraper agents for browsing tasks — they require specific parameters you do not have.
+Intent categories: browse | research | summarize | memory | configuration | composite
 
-Each step must have:
-- id: unique string (e.g. "1", "2", "3")
-- agent: ALWAYS "browser" for search/find tasks
-- action: specific action for that agent
-- params: object with parameters
-- dependsOn: (optional) id of prior step this depends on
+RULES:
+1. NEVER open a new tab to search. ALWAYS use "browser.search" in the CURRENT tab.
+2. For "find/search/what are/best/top" queries → ALWAYS use the full research pipeline:
+   { search } → { wait 2500ms } → { analyze_page }
+3. For summarize/analyze current page → single { analyze_page } step.
+4. For settings/how-to/configure questions → single { config.get_walkthrough } step.
+5. Extract constraints from the query (rating, price, duration, level, date) and include in intent description.
+6. Use ONLY agents: browser, config, summarizer, memory.
 
-Available actions (use browser agent ONLY for all browsing/searching):
-- browser: open_tab, close_tab, switch_tab, scroll, click, type, wait, read_page, analyze_page, search
-- summarizer: summarize, bullets  (only use when you have text to summarize)
-- memory: store, retrieve  (only use for storing/retrieving facts)
+Step format: id:1 | agent:browser | action:search | params.value:query | dependsOn:0
+Actions: browser→(open_tab|close_tab|scroll|click|type|wait|read_page|analyze_page|search) | config→get_walkthrough | summarizer→(summarize|bullets) | memory→(store|retrieve)
 
-Output JSON (strict):
-{
-  "intent": "brief description",
-  "category": "browse|research|summarize|memory|composite",
-  "steps": [ { "id": "1", "agent": "browser", "action": "search", "params": { "value": "query" } } ],
-  "reasoning": "explanation"
-}
+Output ONLY this TOON block (no extra text, no markdown):
+intent: ...
+category: ...
+reasoning: ...
+[STEPS]
+id:1 | agent:... | action:... | params.key:val
+[/STEPS]
 
 EXAMPLES:
-
-User: "find top posts about AI agents" (Context: reddit.com)
-{
-  "intent": "Search Reddit for AI agent posts and analyze results",
-  "category": "research",
-  "steps": [
-    { "id": "1", "agent": "browser", "action": "search", "params": { "value": "AI agents autonomous LLM" } },
-    { "id": "2", "agent": "browser", "action": "wait", "params": { "duration": 2500 }, "dependsOn": "1" },
-    { "id": "3", "agent": "browser", "action": "analyze_page", "params": { "maxScrolls": 8, "scrollDelay": 300 }, "dependsOn": "2" }
-  ],
-  "reasoning": "User wants research results. Full pipeline: search → wait for load → analyze/scrape results page."
-}
-
-User: "search for latest ai news" (Context: google.com)
-{
-  "intent": "Search Google for AI news and summarize results",
-  "category": "research",
-  "steps": [
-    { "id": "1", "agent": "browser", "action": "search", "params": { "value": "latest AI news 2025" } },
-    { "id": "2", "agent": "browser", "action": "wait", "params": { "duration": 2500 }, "dependsOn": "1" },
-    { "id": "3", "agent": "browser", "action": "analyze_page", "params": { "maxScrolls": 5, "scrollDelay": 300 }, "dependsOn": "2" }
-  ],
-  "reasoning": "Full research pipeline: search → wait → analyze results."
-}
+User: "find best python courses" (on udemy.com)
+intent: Search Udemy for best Python courses and rank results
+category: research
+reasoning: Full research pipeline on current site.
+[STEPS]
+id:1 | agent:browser | action:search | params.value:best python courses
+id:2 | agent:browser | action:wait | params.duration:2500 | dependsOn:1
+id:3 | agent:browser | action:analyze_page | params.maxScrolls:8 | params.scrollDelay:300 | dependsOn:2
+[/STEPS]
 
 User: "summarize this page"
-{
-  "intent": "Summarize current page content",
-  "category": "summarize",
-  "steps": [
-    { "id": "1", "agent": "browser", "action": "analyze_page", "params": { "maxScrolls": 10, "scrollDelay": 400 } }
-  ],
-  "reasoning": "User wants summary of current page — direct analyze."
-}
+intent: Summarize current page
+category: summarize
+reasoning: Direct page analysis.
+[STEPS]
+id:1 | agent:browser | action:analyze_page | params.maxScrolls:10 | params.scrollDelay:400
+[/STEPS]
 
-User: "open youtube and search for react tutorials"
-{
-  "intent": "Open YouTube and search for React tutorials",
-  "category": "research",
-  "steps": [
-    { "id": "1", "agent": "browser", "action": "open_tab", "params": { "url": "https://youtube.com" } },
-    { "id": "2", "agent": "browser", "action": "wait", "params": { "duration": 2000 }, "dependsOn": "1" },
-    { "id": "3", "agent": "browser", "action": "search", "params": { "value": "react tutorials beginners" }, "dependsOn": "2" },
-    { "id": "4", "agent": "browser", "action": "wait", "params": { "duration": 2500 }, "dependsOn": "3" },
-    { "id": "5", "agent": "browser", "action": "analyze_page", "params": { "maxScrolls": 5, "scrollDelay": 300 }, "dependsOn": "4" }
-  ],
-  "reasoning": "User explicitly asked to open YouTube, then full research pipeline."
-}`;
+User: "how do I enable 2FA on Facebook?"
+intent: Enable 2FA on Facebook
+category: configuration
+reasoning: Config walkthrough request.
+[STEPS]
+id:1 | agent:config | action:get_walkthrough | params.query:enable two-factor authentication on Facebook
+[/STEPS]`;
+
 
 export async function planIntent(request: IntentRequest): Promise<StepPlan> {
   let userPrompt = `User command: "${request.prompt}"`;
@@ -152,14 +119,67 @@ export async function planIntent(request: IntentRequest): Promise<StepPlan> {
     console.log('[ASTRA] Skipping vision for search query — using text-only planning (fast path)');
   }
 
-  const plan = await chatJSON<StepPlan>(PLANNER_SYSTEM_PROMPT, userPrompt);
-  console.log('[ASTRA] Planner generated:', JSON.stringify(plan, null, 2));
+  // Use standard chat instead of chatJSON to get TOON output
+  const { chat } = await import('../services/llm.js');
 
-  // Validate plan structure
-  if (!plan.intent || !plan.category || !Array.isArray(plan.steps)) {
-    throw new Error('Invalid plan structure from LLM');
+  // Enforce /no_think tag manually since we aren't using chatJSON
+  const rawResponse = await chat(`/no_think\n${PLANNER_SYSTEM_PROMPT}`, userPrompt);
+  console.log('[ASTRA] Planner generated TOON:\n', rawResponse);
+
+  // Parse TOON back into the StepPlan JSON structure for the API
+  const plan: Partial<StepPlan> = { steps: [] };
+
+  const lines = rawResponse.split('\n');
+  let parsingSteps = false;
+
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+
+    if (trimmed.startsWith('[STEPS]')) {
+      parsingSteps = true;
+      continue;
+    }
+    if (trimmed.startsWith('[/STEPS]')) {
+      parsingSteps = false;
+      continue;
+    }
+
+    if (!parsingSteps) {
+      if (trimmed.startsWith('intent:')) plan.intent = trimmed.substring(7).trim();
+      else if (trimmed.startsWith('category:')) plan.category = trimmed.substring(9).trim() as any;
+      else if (trimmed.startsWith('reasoning:')) plan.reasoning = trimmed.substring(10).trim();
+    } else {
+      // Parse a pipe|separated step
+      const stepObj: any = { params: {} };
+      const chunks = trimmed.split('|');
+      for (const chunk of chunks) {
+        const colonIdx = chunk.indexOf(':');
+        if (colonIdx > 0) {
+          const key = chunk.substring(0, colonIdx).trim();
+          let val: any = chunk.substring(colonIdx + 1).trim();
+
+          if (!isNaN(Number(val))) val = Number(val);
+
+          if (key.startsWith('params.')) {
+            const paramKey = key.substring(7);
+            stepObj.params[paramKey] = val;
+          } else {
+            stepObj[key] = String(val); // id, agent, action are strings
+          }
+        }
+      }
+      if (stepObj.id && stepObj.action) {
+        plan.steps!.push(stepObj as any);
+      }
+    }
   }
 
-  return plan;
+  // Validate plan structure
+  if (!plan.intent || !plan.category || !plan.steps || plan.steps.length === 0) {
+    throw new Error('Invalid TOON plan structure from LLM');
+  }
+
+  return plan as StepPlan;
 }
 
