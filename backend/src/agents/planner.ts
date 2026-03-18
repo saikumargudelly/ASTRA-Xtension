@@ -1,5 +1,6 @@
 // Planner using TOON output
 import type { StepPlan, IntentRequest } from '../types/index.js';
+import { normalizeRegion, applyRegionToPlanSteps } from '../config/regionalUrls.js';
 
 // Configuration patterns for early detection
 const CONFIG_PATTERNS = [
@@ -26,9 +27,16 @@ RULES:
 4. For settings/how-to/configure questions → single { config.get_walkthrough } step.
 5. Extract constraints from the query (rating, price, duration, level, date) and include in intent description.
 6. Use ONLY agents: browser, config, summarizer, memory.
+7. ALL selectors MUST be valid CSS selectors (used with document.querySelector). NEVER use XPath.
 
-Step format: id:1 | agent:browser | action:search | params.value:query | dependsOn:0
-Actions: browser→(open_tab|close_tab|scroll|click|type|wait|read_page|analyze_page|search) | config→get_walkthrough | summarizer→(summarize|bullets) | memory→(store|retrieve)
+★★★ MOST IMPORTANT RULE ★★★
+8. For browse/navigate tasks (open X, go to Y, play Z on Netflix):
+   - Your plan MUST be EXACTLY: open_tab → wait → analyze_page. ONLY these 3 steps. NOTHING ELSE.
+   - Do NOT add search, click, type, or any other steps after analyze_page.
+   - The extension has a LIVE page-analysis loop that handles ALL interactions AFTER navigation.
+   - You have NEVER seen the target page. You CANNOT know what buttons/links exist.
+   - Any click/search/type steps you add will be WRONG and will BREAK the execution.
+   - Even if the user says "play X" or "search for Y", do NOT add those steps. The live loop handles it.
 
 Output ONLY this TOON block (no extra text, no markdown):
 intent: ...
@@ -63,6 +71,26 @@ category: configuration
 reasoning: Config walkthrough request.
 [STEPS]
 id:1 | agent:config | action:get_walkthrough | params.query:enable two-factor authentication on Facebook
+[/STEPS]
+
+User: "open netflix and play peaky blinders"
+intent: Open Netflix and play Peaky Blinders
+category: browse
+reasoning: Navigate to Netflix first. The live analysis loop will handle profile selection, search, and playback once we can see the actual page. We must NOT guess what's on the page.
+[STEPS]
+id:1 | agent:browser | action:open_tab | params.url:https://www.netflix.com | dependsOn:0
+id:2 | agent:browser | action:wait | params.duration:3000 | dependsOn:1
+id:3 | agent:browser | action:analyze_page | dependsOn:2
+[/STEPS]
+
+User: "go to youtube and play lofi beats"
+intent: Open YouTube and play lofi beats
+category: browse
+reasoning: Navigate to YouTube. The live loop will handle search and playback after landing.
+[STEPS]
+id:1 | agent:browser | action:open_tab | params.url:https://www.youtube.com | dependsOn:0
+id:2 | agent:browser | action:wait | params.duration:3000 | dependsOn:1
+id:3 | agent:browser | action:analyze_page | dependsOn:2
 [/STEPS]`;
 
 
@@ -82,12 +110,12 @@ export async function planIntent(request: IntentRequest): Promise<StepPlan> {
 
   if (needsVision) {
     try {
-      // 8-second timeout on vision call so it can never hang forever
+      // 20-second timeout on vision — large VLMs need time for image processing
       const vision = await import('./vision.js');
       const screenState = await Promise.race([
         vision.analyzeScreen(request.screenshot!, request.prompt),
         new Promise<never>((_, reject) =>
-          setTimeout(() => reject(new Error('Vision timeout after 8s')), 8000)
+          setTimeout(() => reject(new Error('Vision timeout after 20s')), 20000)
         ),
       ]);
 
@@ -115,9 +143,10 @@ export async function planIntent(request: IntentRequest): Promise<StepPlan> {
     }
   }
   // Use standard chat instead of chatJSON to get TOON output
+  // Planner is a high-stakes planning task → route to the 70B model
   const { chat } = await import('../services/llm.js');
 
-  const rawResponse = await chat(PLANNER_SYSTEM_PROMPT, userPrompt);
+  const rawResponse = await chat(PLANNER_SYSTEM_PROMPT, userPrompt, 'planning');
   console.log('[ASTRA] Planner generated TOON:\n', rawResponse);
 
   // Parse TOON back into the StepPlan JSON structure for the API
@@ -172,6 +201,12 @@ export async function planIntent(request: IntentRequest): Promise<StepPlan> {
   // Validate plan structure
   if (!plan.intent || !plan.category || !plan.steps || plan.steps.length === 0) {
     throw new Error('Invalid TOON plan structure from LLM');
+  }
+
+  // Apply region so open_tab URLs use the user's locale (e.g. India → amazon.in, netflix.com/in)
+  const region = request.context?.region != null ? normalizeRegion(request.context.region) : undefined;
+  if (region) {
+    applyRegionToPlanSteps(plan.steps as Array<{ action?: string; params?: Record<string, unknown> }>, region);
   }
 
   return plan as StepPlan;

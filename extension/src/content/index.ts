@@ -11,7 +11,54 @@ import type {
     PageTable,
     PageImage,
     ViewportSnapshot,
+    HoverElementMessage,
+    FillFormMessage,
+    ExtractDataMessage,
+    WaitForElementMessage,
+    KeyboardShortcutMessage,
 } from '../types/messages';
+
+// ─── Content-Script Security Helpers ───────────────────────────────────────────────
+// Defense-in-depth: even if a malicious selector slips through the background
+// SecurityGuard, these checks prevent XSS and prototype pollution inside the page.
+
+const SELECTOR_INJECTION_RE = /(<script|javascript:|on\w+=|expression\s*\(|import\s*\()/i;
+
+function safeQuerySelector(selector: string): Element | null {
+    if (!selector || typeof selector !== 'string' || selector.length > 512) return null;
+    if (SELECTOR_INJECTION_RE.test(selector)) {
+        console.warn('[ASTRA|SECURITY] Rejected selector:', selector.slice(0, 60));
+        return null;
+    }
+    try {
+        return document.querySelector(selector);
+    } catch {
+        return null;
+    }
+}
+
+function safeQuerySelectorAll(selector: string): Element[] {
+    if (!selector || typeof selector !== 'string' || selector.length > 512) return [];
+    if (SELECTOR_INJECTION_RE.test(selector)) {
+        console.warn('[ASTRA|SECURITY] Rejected selector (all):', selector.slice(0, 60));
+        return [];
+    }
+    try {
+        return Array.from(document.querySelectorAll(selector));
+    } catch {
+        return [];
+    }
+}
+
+function safeValue(val: string): string {
+    if (typeof val !== 'string') return '';
+    // Guard against javascript: protocol in input values
+    if (/javascript:/i.test(val)) {
+        console.warn('[ASTRA|SECURITY] Rejected value containing javascript: protocol');
+        return '';
+    }
+    return val.slice(0, 2048);
+}
 
 // ─── Message Listener ───
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
@@ -67,25 +114,713 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     // ─── CLICK_ELEMENT: Click a specific element by selector with cursor animation ───
     if (message.type === 'CLICK_ELEMENT') {
         const { selector, label } = message.payload || {};
-        const el = document.querySelector(selector) as HTMLElement;
+        const attemptClick = (el: HTMLElement) => {
+            (async () => {
+                await cursorFocusElement(el, label || 'Clicking...');
+                cursorClick();
+
+                // Modern SPA robust click sequence with spatial coordinates
+                const rect = el.getBoundingClientRect();
+                const clientX = rect.left + rect.width / 2;
+                const clientY = rect.top + rect.height / 2;
+                const eventOpts = { bubbles: true, cancelable: true, clientX, clientY };
+
+                el.dispatchEvent(new PointerEvent('pointerover', eventOpts));
+                el.dispatchEvent(new PointerEvent('pointerenter', eventOpts));
+                el.dispatchEvent(new PointerEvent('pointerdown', eventOpts));
+                el.dispatchEvent(new MouseEvent('mousedown', eventOpts));
+                el.dispatchEvent(new PointerEvent('pointerup', eventOpts));
+                el.dispatchEvent(new MouseEvent('mouseup', eventOpts));
+                el.click();
+                el.dispatchEvent(new Event('change', { bubbles: true }));
+
+                await sleep(300);
+                hideCursorFeedback();
+                setTimeout(() => removeAstraCursor(), 800);
+                sendResponse({ success: true });
+            })();
+        };
+
+        let el = safeQuerySelector(selector) as HTMLElement;
+        
+        // Smart retry: if element not found, wait briefly (SPA rendering delay)
+        if (!el) {
+            setTimeout(() => {
+                el = safeQuerySelector(selector) as HTMLElement;
+                // Last resort: try broader selector (strip nth-of-type, etc.)
+                if (!el && selector.includes(':nth-of-type')) {
+                    const simplified = selector.replace(/:nth-of-type\(\d+\)/, '');
+                    el = safeQuerySelector(simplified) as HTMLElement;
+                }
+                if (!el) {
+                    sendResponse({ success: false, error: `Element not found: ${selector}` });
+                    return;
+                }
+                attemptClick(el);
+            }, 500);
+            return true;
+        }
+        // Last resort: try broader selector (strip nth-of-type, etc.)
+        if (!el && selector.includes(':nth-of-type')) {
+            const simplified = selector.replace(/:nth-of-type\(\d+\)/, '');
+            el = safeQuerySelector(simplified) as HTMLElement;
+        }
+        
+        if (!el) {
+            sendResponse({ success: false, error: `Element not found: ${selector}` });
+            return true;
+        }
+        attemptClick(el);
+        return true;
+    }
+
+    // ─── HOVER_ELEMENT: Hover over an element with cursor animation ───────────────
+    if (message.type === 'HOVER_ELEMENT') {
+        const { selector, label } = (message as HoverElementMessage).payload || {};
+        const el = safeQuerySelector(selector) as HTMLElement | null;
         if (!el) {
             sendResponse({ success: false, error: `Element not found: ${selector}` });
             return true;
         }
         (async () => {
-            await cursorFocusElement(el, label || 'Applying filter...');
-            cursorClick();
-            el.click();
-            await sleep(300);
+            el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+            await sleep(150);
+            await cursorFocusElement(el, label || 'Hovering...');
+            const rect = el.getBoundingClientRect();
+            const opts = { bubbles: true, cancelable: true, clientX: rect.left + rect.width / 2, clientY: rect.top + rect.height / 2 };
+            el.dispatchEvent(new PointerEvent('pointerover', opts));
+            el.dispatchEvent(new PointerEvent('pointerenter', opts));
+            el.dispatchEvent(new MouseEvent('mouseover', opts));
+            el.dispatchEvent(new MouseEvent('mouseenter', opts));
+            await sleep(400);
             hideCursorFeedback();
             setTimeout(() => removeAstraCursor(), 800);
             sendResponse({ success: true });
         })();
         return true;
     }
+
+    // ─── FILL_FORM: Fill multiple form fields atomically ─────────────────────────────
+    if (message.type === 'FILL_FORM') {
+        const { fields } = (message as FillFormMessage).payload || {};
+        (async () => {
+            const results: Array<{ selector: string; success: boolean; error?: string }> = [];
+            for (const field of (fields ?? [])) {
+                const el = safeQuerySelector(field.selector) as HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement | null;
+                if (!el) {
+                    results.push({ selector: field.selector, success: false, error: 'Element not found' });
+                    continue;
+                }
+                const safeVal = safeValue(field.value);
+                try {
+                    el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                    el.focus();
+                    if (el instanceof HTMLSelectElement) {
+                        const option = Array.from(el.options).find(
+                            o => o.value === safeVal || o.text.toLowerCase() === safeVal.toLowerCase()
+                        );
+                        if (option) {
+                            el.value = option.value;
+                            el.dispatchEvent(new Event('change', { bubbles: true }));
+                        }
+                    } else {
+                        // React-safe value setter
+                        const valueSetter = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(el), 'value')?.set;
+                        if (valueSetter) valueSetter.call(el, safeVal);
+                        else (el as HTMLInputElement).value = safeVal;
+                        el.dispatchEvent(new Event('input', { bubbles: true }));
+                        el.dispatchEvent(new Event('change', { bubbles: true }));
+                    }
+                    results.push({ selector: field.selector, success: true });
+                } catch (err) {
+                    results.push({ selector: field.selector, success: false, error: (err as Error).message });
+                }
+                await sleep(100);
+            }
+            const allOk = results.every(r => r.success);
+            sendResponse({ success: allOk, data: { results } });
+        })();
+        return true;
+    }
+
+    // ─── EXTRACT_DATA: Extract structured text/attribute from elements ────────────
+    if (message.type === 'EXTRACT_DATA') {
+        const { selector, attribute, multiple } = (message as ExtractDataMessage).payload || {};
+        try {
+            if (multiple) {
+                const els = safeQuerySelectorAll(selector);
+                const values = els.map(el => {
+                    if (attribute) return (el as HTMLElement).getAttribute(attribute) ?? '';
+                    return (el as HTMLElement).innerText?.trim() ?? el.textContent?.trim() ?? '';
+                }).filter(Boolean).slice(0, 50); // Cap at 50 items
+                sendResponse({ success: true, data: { values } });
+            } else {
+                const el = safeQuerySelector(selector) as HTMLElement | null;
+                if (!el) {
+                    sendResponse({ success: false, error: `Element not found: ${selector}` });
+                    return true;
+                }
+                const value = attribute
+                    ? el.getAttribute(attribute) ?? ''
+                    : (el.innerText?.trim() ?? el.textContent?.trim() ?? '');
+                sendResponse({ success: true, data: { value: value.slice(0, 4096) } });
+            }
+        } catch (err) {
+            sendResponse({ success: false, error: (err as Error).message });
+        }
+        return true;
+    }
+
+    // ─── WAIT_FOR_ELEMENT: Poll until an element appears or timeout ─────────────────
+    if (message.type === 'WAIT_FOR_ELEMENT') {
+        const { selector, timeout = 5000, visible = true } = (message as WaitForElementMessage).payload || {};
+        const start = Date.now();
+        const POLL_MS = 150;
+        let resolved = false;
+        const timer = setInterval(() => {
+            const el = safeQuerySelector(selector) as HTMLElement | null;
+            const ready = el && (!visible || isVisible(el));
+            if (ready || Date.now() - start > timeout) {
+                clearInterval(timer);
+                if (!resolved) {
+                    resolved = true;
+                    if (ready) {
+                        sendResponse({ success: true, data: { found: true, elapsed: Date.now() - start } });
+                    } else {
+                        sendResponse({ success: false, error: `Timeout waiting for: ${selector}` });
+                    }
+                }
+            }
+        }, POLL_MS);
+        return true;
+    }
+
+    // ─── KEYBOARD_SHORTCUT: Dispatch keyboard events to the page ──────────────────
+    if (message.type === 'KEYBOARD_SHORTCUT') {
+        const { keys } = (message as KeyboardShortcutMessage).payload || {};
+        const ALLOWED_KEYS = new Set([
+            'Enter', 'Tab', 'Escape', 'Backspace', 'Delete', 'Space',
+            'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight',
+            'Home', 'End', 'PageUp', 'PageDown',
+            'F1', 'F2', 'F3', 'F4', 'F5', 'F12',
+            'Control', 'Alt', 'Shift', 'Meta',
+            'Ctrl+C', 'Ctrl+V', 'Ctrl+X', 'Ctrl+A', 'Ctrl+Z', 'Ctrl+Y',
+            'Ctrl+F', 'Ctrl+T', 'Ctrl+W', 'Ctrl+R', 'Ctrl+L',
+        ]);
+        (async () => {
+            for (const key of (keys ?? [])) {
+                if (!ALLOWED_KEYS.has(key)) {
+                    console.warn('[ASTRA|SECURITY] Blocked keyboard key:', key);
+                    continue;
+                }
+                // Parse combo keys like Ctrl+C
+                const parts = key.split('+');
+                const mainKey = parts[parts.length - 1];
+                const opts: KeyboardEventInit = {
+                    key: mainKey, code: `Key${mainKey.toUpperCase()}`,
+                    ctrlKey: parts.includes('Ctrl') || parts.includes('Control'),
+                    altKey: parts.includes('Alt'),
+                    shiftKey: parts.includes('Shift'),
+                    metaKey: parts.includes('Meta'),
+                    bubbles: true, cancelable: true,
+                };
+                const target = document.activeElement ?? document.body;
+                target.dispatchEvent(new KeyboardEvent('keydown', opts));
+                target.dispatchEvent(new KeyboardEvent('keypress', opts));
+                target.dispatchEvent(new KeyboardEvent('keyup', opts));
+                await sleep(80);
+            }
+            sendResponse({ success: true });
+        })();
+        return true;
+    }
+
+    // ─── GET_PAGE_SNAPSHOT: Full interactive element map for intent-first pipeline ───
+    if (message.type === 'GET_PAGE_SNAPSHOT') {
+        (async () => {
+            try {
+                const snapshot = getPageSnapshot();
+                sendResponse({ success: true, data: snapshot });
+            } catch (err) {
+                sendResponse({ success: false, error: (err as Error).message });
+            }
+        })();
+        return true;
+    }
+
+    // ─── SHOW_FOLLOW_UP: Inject floating question overlay on this page ───
+    if (message.type === 'SHOW_FOLLOW_UP') {
+        const { question, options, context, category } = message.payload || {};
+        showFollowUpOverlay(question, options, context, category);
+        sendResponse({ success: true });
+        return true;
+    }
+
+    // ─── HIDE_FOLLOW_UP: Remove the overlay ───
+    if (message.type === 'HIDE_FOLLOW_UP') {
+        hideFollowUpOverlay();
+        sendResponse({ success: true });
+        return true;
+    }
 });
 
-// ─── Filter/Sort Discovery System ───
+// ─── Follow-Up Question Overlay ───────────────────────────────────────────────
+// Floating card injected into the page when the agent needs user input.
+// Stays visible even if the popup closes (which happens on tab switch).
+
+const OVERLAY_ID = 'astra-followup-overlay';
+
+function hideFollowUpOverlay(): void {
+    const existing = document.getElementById(OVERLAY_ID);
+    if (existing) existing.remove();
+}
+
+function showFollowUpOverlay(
+    question: string,
+    options?: string[],
+    context?: string,
+    category?: string,
+): void {
+    // Remove any existing overlay
+    hideFollowUpOverlay();
+
+    // Create shadow host for style isolation
+    const host = document.createElement('div');
+    host.id = OVERLAY_ID;
+    host.style.cssText = 'position:fixed;top:0;right:0;z-index:2147483647;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;';
+    const shadow = host.attachShadow({ mode: 'closed' });
+
+    // Category emoji
+    const categoryEmoji: Record<string, string> = {
+        profile_select: '👤',
+        login_required: '🔑',
+        cookie_consent: '🍪',
+        captcha: '🤖',
+        age_verify: '🔞',
+        disambiguation: '🔍',
+        general: '💬',
+    };
+    const emoji = categoryEmoji[category ?? 'general'] ?? '💬';
+
+    // Build HTML
+    const card = document.createElement('div');
+    card.innerHTML = `
+        <style>
+            :host { all: initial; }
+            .astra-card {
+                position: fixed;
+                top: 20px;
+                right: 20px;
+                width: 340px;
+                max-width: calc(100vw - 40px);
+                background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+                border: 1px solid rgba(124, 77, 255, 0.4);
+                border-radius: 16px;
+                padding: 20px;
+                box-shadow: 0 8px 32px rgba(0,0,0,0.5), 0 0 0 1px rgba(124,77,255,0.2);
+                color: #e0e0e0;
+                font-size: 14px;
+                line-height: 1.5;
+                animation: astra-slide-in 0.3s ease-out;
+            }
+            @keyframes astra-slide-in {
+                from { transform: translateX(100px); opacity: 0; }
+                to { transform: translateX(0); opacity: 1; }
+            }
+            .astra-header {
+                display: flex;
+                align-items: center;
+                gap: 8px;
+                margin-bottom: 12px;
+                font-size: 12px;
+                font-weight: 600;
+                color: #7c4dff;
+                text-transform: uppercase;
+                letter-spacing: 0.5px;
+            }
+            .astra-logo {
+                width: 20px;
+                height: 20px;
+                border-radius: 50%;
+                background: linear-gradient(135deg, #7c4dff, #448aff);
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                font-size: 11px;
+                color: white;
+                flex-shrink: 0;
+            }
+            .astra-question {
+                font-size: 15px;
+                font-weight: 500;
+                color: #ffffff;
+                margin-bottom: 16px;
+            }
+            .astra-context {
+                font-size: 12px;
+                color: #999;
+                margin-bottom: 12px;
+                font-style: italic;
+            }
+            .astra-options {
+                display: flex;
+                flex-direction: column;
+                gap: 8px;
+                margin-bottom: 12px;
+            }
+            .astra-option-btn {
+                background: rgba(124, 77, 255, 0.15);
+                border: 1px solid rgba(124, 77, 255, 0.3);
+                border-radius: 10px;
+                padding: 10px 14px;
+                color: #e0e0e0;
+                font-size: 14px;
+                cursor: pointer;
+                text-align: left;
+                transition: all 0.15s ease;
+            }
+            .astra-option-btn:hover {
+                background: rgba(124, 77, 255, 0.35);
+                border-color: #7c4dff;
+                color: #fff;
+                transform: translateX(4px);
+            }
+            .astra-input-row {
+                display: flex;
+                gap: 8px;
+            }
+            .astra-input {
+                flex: 1;
+                background: rgba(255,255,255,0.08);
+                border: 1px solid rgba(255,255,255,0.15);
+                border-radius: 8px;
+                padding: 8px 12px;
+                color: #fff;
+                font-size: 13px;
+                outline: none;
+            }
+            .astra-input:focus {
+                border-color: #7c4dff;
+            }
+            .astra-send-btn {
+                background: linear-gradient(135deg, #7c4dff, #448aff);
+                border: none;
+                border-radius: 8px;
+                padding: 8px 16px;
+                color: white;
+                font-size: 13px;
+                font-weight: 600;
+                cursor: pointer;
+            }
+            .astra-send-btn:hover {
+                filter: brightness(1.15);
+            }
+        </style>
+        <div class="astra-card">
+            <div class="astra-header">
+                <div class="astra-logo">A</div>
+                <span>ASTRA needs your input ${emoji}</span>
+            </div>
+            ${context ? `<div class="astra-context">${escapeHtml(context)}</div>` : ''}
+            <div class="astra-question">${escapeHtml(question)}</div>
+            ${options && options.length > 0 ? `
+                <div class="astra-options">
+                    ${options.map(opt => `<button class="astra-option-btn" data-answer="${escapeAttr(opt)}">${escapeHtml(opt)}</button>`).join('')}
+                </div>
+            ` : ''}
+            <div class="astra-input-row">
+                <input class="astra-input" type="text" placeholder="Or type your answer..." />
+                <button class="astra-send-btn">Send</button>
+            </div>
+        </div>
+    `;
+
+    shadow.appendChild(card);
+
+    // Event handlers
+    function sendAnswer(answer: string) {
+        if (!answer.trim()) return;
+        chrome.runtime.sendMessage({ type: 'FOLLOW_UP_RESPONSE', payload: { answer: answer.trim() } });
+        hideFollowUpOverlay();
+    }
+
+    // Option buttons
+    shadow.querySelectorAll('.astra-option-btn').forEach(btn => {
+        btn.addEventListener('click', () => {
+            sendAnswer((btn as HTMLElement).dataset.answer || btn.textContent || '');
+        });
+    });
+
+    // Text input + send
+    const input = shadow.querySelector('.astra-input') as HTMLInputElement;
+    const sendBtn = shadow.querySelector('.astra-send-btn') as HTMLButtonElement;
+    sendBtn.addEventListener('click', () => sendAnswer(input.value));
+    input.addEventListener('keydown', (e) => {
+        if ((e as KeyboardEvent).key === 'Enter') sendAnswer(input.value);
+    });
+
+    document.body.appendChild(host);
+}
+
+function escapeHtml(str: string): string {
+    const div = document.createElement('div');
+    div.textContent = str;
+    return div.innerHTML;
+}
+
+function escapeAttr(str: string): string {
+    return str.replace(/"/g, '&quot;').replace(/'/g, '&#39;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+// ─── Universal Page Snapshot ──────────────────────────────────────────────────
+// Returns ALL interactive elements with semantic enrichment.
+// This is the ONLY source of truth for the LLM action planner —
+// it must only use selectors from this list (no invented ones).
+interface SnapshotElement {
+    idx: number;
+    type: string;
+    label: string;
+    selector: string;
+    value?: string;
+    section?: string;
+    context?: string; // Semantic text sibling
+    role?: string;
+    min?: string;
+    max?: string;
+    options?: string[];
+}
+
+function getPageSnapshot(): {
+    url: string;
+    title: string;
+    visibleText: string;
+    interactiveElements: SnapshotElement[];
+} {
+    const elements: SnapshotElement[] = [];
+    const seen = new Set<string>();
+    let idx = 0;
+
+    // ─── Selector builder — generates a unique, stable CSS selector ───────
+    const buildSelector = (el: Element): string => {
+        if (el.id) return `#${CSS.escape(el.id)}`;
+        const testId = el.getAttribute('data-testid') || el.getAttribute('data-purpose');
+        if (testId) return `[data-testid="${testId}"]`;
+        const name = el.getAttribute('name');
+        if (name) return `${el.tagName.toLowerCase()}[name="${name}"]`;
+        const aria = el.getAttribute('aria-label');
+        if (aria && aria.length < 80) return `[aria-label="${CSS.escape(aria)}"]`;
+        const href = el.tagName === 'A' ? el.getAttribute('href') : null;
+        if (href && href.length < 120) return `a[href="${CSS.escape(href)}"]`;
+        // Class-based with index disambiguation
+        const classes = Array.from(el.classList)
+            .filter(c => c.length < 40 && !/^[a-f0-9]{6,}$/.test(c))
+            .slice(0, 2).join('.');
+        if (classes) {
+            const parent = el.parentElement;
+            const tag = el.tagName.toLowerCase();
+            if (parent) {
+                const siblings = Array.from(parent.querySelectorAll(`:scope > ${tag}.${classes.split('.')[0]}`));
+                const nth = siblings.indexOf(el as HTMLElement);
+                if (siblings.length === 1) return `${tag}.${classes}`;
+                if (nth >= 0) return `${tag}.${classes}:nth-of-type(${nth + 1})`;
+            }
+            return `${tag}.${classes}`;
+        }
+        return '';
+    };
+
+    // ─── Section resolver — which panel/sidebar owns this element ─────────
+    const getSectionLabel = (el: Element): string | undefined => {
+        const panel = el.closest(
+            '[class*="sidebar" i], [class*="filter" i], [class*="facet" i], ' +
+            '[class*="refinement" i], aside, nav, [role="navigation"], ' +
+            '[class*="sort" i], [class*="toolbar" i], [class*="options" i]'
+        );
+        if (!panel) return undefined;
+        // Find first heading-like text in panel
+        const heading = panel.querySelector('h1,h2,h3,h4,h5,summary,[class*="title" i],[class*="heading" i]');
+        const label = (heading?.textContent || panel.getAttribute('aria-label') || '').trim().slice(0, 40);
+        return label || undefined;
+    };
+
+    // ─── Role inference from label + context ──────────────────────────────
+    const inferRole = (label: string, el: Element, type: string): string => {
+        const l = label.toLowerCase();
+        if (/price|₹|\$|rs\.|budget|cost/.test(l)) return 'price-range';
+        if (/sort|order by|arrange/.test(l)) return 'sort';
+        if (/rating|star|review/.test(l)) return 'rating';
+        if (/brand|seller|maker/.test(l)) return 'brand-filter';
+        if (/category|type|genre/.test(l)) return 'category-filter';
+        if (/delivery|shipping|dispatch/.test(l)) return 'delivery-filter';
+        if (type === 'link' && !el.closest('[class*="filter" i],[class*="sidebar" i],aside')) return 'navigation';
+        return 'filter';
+    };
+
+    // ─── Semantic DOM Context (nearest text sibling) ──────────────────────
+    const getSemanticContext = (el: Element): string | undefined => {
+        // Find a localized container (row, list item, label, fieldset, or direct parent)
+        const container = el.closest('tr, li, label, .form-group, .field, fieldset, .MuiFormControl-root, .ant-form-item') || el.parentElement;
+        if (!container) return undefined;
+
+        let text = (container as HTMLElement).innerText || container.textContent || '';
+        text = text.replace(el.textContent || '', '').replace(/\s+/g, ' ').trim();
+
+        if (text.length > 0 && text.length < 150 && text !== el.textContent?.trim()) {
+            return text;
+        }
+        return undefined;
+    };
+
+    // ─── Push an element, deduplicating by selector ───────────────────────
+    const push = (el: Element, type: string, label: string, extras: Partial<SnapshotElement> = {}) => {
+        if (!isVisible(el as HTMLElement)) return;
+        const selector = buildSelector(el);
+        if (!selector || seen.has(selector)) return;
+        if (label.length < 1 || label.length > 100) return;
+        seen.add(selector);
+        elements.push({
+            idx: idx++,
+            type,
+            label: label.slice(0, 80),
+            selector,
+            section: getSectionLabel(el),
+            context: getSemanticContext(el),
+            role: inferRole(label, el, type),
+            ...extras,
+        });
+    };
+
+    // 1. Range sliders (price, volume, etc.)  ──────────────────────────────
+    document.querySelectorAll('input[type="range"]').forEach(el => {
+        const inp = el as HTMLInputElement;
+        const labelEl = inp.labels?.[0] || inp.closest('label') || inp.parentElement;
+        const label = (inp.getAttribute('aria-label') || labelEl?.textContent || 'Range slider').trim();
+        push(inp, 'range', label, {
+            value: inp.value,
+            min: inp.min || '0',
+            max: inp.max || '100',
+            role: 'price-range',
+        });
+    });
+
+    // 2. Number inputs (custom price min/max boxes) ────────────────────────
+    document.querySelectorAll('input[type="number"], input[type="text"][class*="price" i], input[placeholder*="price" i], input[placeholder*="min" i], input[placeholder*="max" i]').forEach(el => {
+        const inp = el as HTMLInputElement;
+        const labelEl = inp.labels?.[0] || inp.closest('label');
+        const label = (inp.getAttribute('aria-label') || inp.getAttribute('placeholder') || labelEl?.textContent || 'Number input').trim();
+        push(inp, 'number-input', label, { value: inp.value, role: 'price-range' });
+    });
+
+    // 3. Checkboxes and radios ─────────────────────────────────────────────
+    document.querySelectorAll('input[type="checkbox"], input[type="radio"]').forEach(el => {
+        const inp = el as HTMLInputElement;
+        const labelEl = inp.labels?.[0] || inp.closest('label') || inp.parentElement;
+        const label = (labelEl?.textContent || inp.getAttribute('aria-label') || '').trim();
+        if (!label) return;
+        push(inp, inp.type, label, { value: inp.checked ? 'checked' : 'unchecked' });
+    });
+
+    // 4. Select dropdowns ─────────────────────────────────────────────────
+    document.querySelectorAll('select').forEach(el => {
+        const sel = el as HTMLSelectElement;
+        const label = (sel.getAttribute('aria-label') || sel.name || sel.closest('label')?.textContent || 'Dropdown').trim();
+        const options = Array.from(sel.options).map(o => o.text.trim()).filter(Boolean).slice(0, 15);
+        push(sel, 'select', label, { value: sel.options[sel.selectedIndex]?.text, options });
+    });
+
+    // 5. Buttons (visible, non-icon-only) ─────────────────────────────────
+    document.querySelectorAll('button, [role="button"], [role="switch"], [role="menuitem"]').forEach(el => {
+        let label = (el.getAttribute('aria-label') || el.getAttribute('title') || el.textContent || '').trim();
+        // For icon-only buttons, try to infer from child img alt or svg title
+        if (!label || label.length < 2) {
+            const img = el.querySelector('img');
+            const svg = el.querySelector('svg title');
+            label = img?.alt || svg?.textContent || '';
+            label = label.trim();
+        }
+        if (!label || label.length > 80) return;
+        push(el, 'button', label);
+    });
+
+    // 6. ALL visible links — not just filter-panel (needed for navigation, profiles, etc.)
+    document.querySelectorAll('a[href]').forEach(el => {
+        let label = (el.getAttribute('aria-label') || el.textContent || '').trim();
+        // For image-only links (profile avatars, thumbnails), use the img alt
+        if (!label || label.length < 2) {
+            const img = el.querySelector('img');
+            label = img?.alt || img?.getAttribute('title') || '';
+            label = label.trim();
+        }
+        if (!label || label.length > 80) return;
+        // Skip very generic labels like single characters or pure URLs
+        if (label.length < 2) return;
+        push(el, 'link', label);
+    });
+
+    // 7. Text/search inputs (used for forms, search bars, etc.) ────────────
+    document.querySelectorAll('input[type="text"], input[type="email"], input[type="url"], input[type="tel"], input[type="password"], input:not([type]), textarea, [contenteditable="true"]').forEach(el => {
+        const inp = el as HTMLInputElement;
+        // Skip hidden/number/range (already captured above)
+        if (inp.type === 'hidden' || inp.type === 'number' || inp.type === 'range') return;
+        const labelEl = inp.labels?.[0] || inp.closest('label');
+        const label = (inp.getAttribute('aria-label') || inp.getAttribute('placeholder') || labelEl?.textContent || inp.name || 'Text input').trim();
+        push(inp, 'text-input', label, { value: inp.value || undefined });
+    });
+
+    // 8. Custom React-style dropdowns / role=listbox ───────────────────────
+    document.querySelectorAll('[role="listbox"], [role="option"], [role="menuitem"], [role="tab"], [role="treeitem"]').forEach(el => {
+        const label = (el.getAttribute('aria-label') || el.textContent || '').trim();
+        if (!label || label.length > 80) return;
+        push(el, 'custom-option', label, {
+            value: el.getAttribute('aria-selected') === 'true' ? 'selected' : 'unselected',
+        });
+    });
+
+    // 9. Data-attribute widgets ──────────────────────────────────────────
+    document.querySelectorAll('[data-filter], [data-sort], [data-value]').forEach(el => {
+        const label = (el.getAttribute('aria-label') || el.textContent || '').trim();
+        if (!label || label.length > 60) return;
+        push(el, 'data-widget', label, { value: el.getAttribute('data-value') || undefined });
+    });
+
+    // 10. Clickable images / profile avatars (not inside already-captured links) ───
+    document.querySelectorAll('img[onclick], img[role="button"], img[tabindex], [class*="profile" i] img, [class*="avatar" i] img').forEach(el => {
+        if (el.closest('a, button, [role="button"]')) return; // Already captured via parent
+        const label = ((el as HTMLImageElement).alt || el.getAttribute('title') || el.getAttribute('aria-label') || '').trim();
+        if (!label || label.length > 80) return;
+        push(el, 'image-button', label);
+    });
+
+    // 11. Dialogs, modals, overlays — important for edge-case detection ────
+    document.querySelectorAll('[role="dialog"], [role="alertdialog"], [class*="modal" i], [class*="overlay" i], [class*="popup" i]').forEach(el => {
+        if (!isVisible(el as HTMLElement)) return;
+        // Find interactive elements INSIDE the dialog
+        el.querySelectorAll('button, a, [role="button"], input').forEach(inner => {
+            const label = ((inner as HTMLElement).getAttribute('aria-label') || (inner as HTMLElement).textContent || '').trim();
+            if (!label || label.length > 80 || label.length < 2) return;
+            push(inner, 'dialog-control', label);
+        });
+    });
+
+    // ─── Visible text excerpt for context ────────────────────────────────
+    // Increased cap: more text = better screen-state classification
+    const visibleText = Array.from(document.querySelectorAll('h1,h2,h3,h4,p,span,li,td,th,label,legend,[role="heading"]'))
+        .filter(e => isVisible(e as HTMLElement))
+        .map(e => (e.textContent || '').trim())
+        .filter(t => t.length > 3 && t.length < 300)
+        .slice(0, 80)
+        .join(' | ')
+        .slice(0, 4000);
+
+    return {
+        url: location.href,
+        title: document.title,
+        visibleText,
+        interactiveElements: elements.slice(0, 200), // Increased cap for richer snapshots
+    };
+}
+
+// ─── Filter/Sort Discovery System (legacy — still used for DISCOVER_FILTERS) ───
 // Scans the page for all interactive filter/sort elements
 // Works across Udemy, Amazon, YouTube, eBay, Coursera, LinkedIn, etc.
 function discoverPageFilters(): Array<{
@@ -1503,12 +2238,35 @@ async function handleDOMAction(message: ExecuteDOMActionMessage) {
     switch (action) {
         case 'click': {
             if (!selector) throw new Error('click requires a selector');
-            const el = document.querySelector(selector) as HTMLElement;
-            if (!el) throw new Error(`Element not found: ${selector}`);
+            let el = safeQuerySelector(selector) as HTMLElement | null;
+            // Retry with a brief wait for SPAs that render lazily
+            if (!el) {
+                await sleep(500);
+                el = safeQuerySelector(selector) as HTMLElement | null;
+            }
+            if (!el) throw new Error(`Element not found: ${selector}. The page may have changed — re-snapshot needed.`);
+            // Ensure visible — scroll into view if needed
+            el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+            await sleep(200);
             // ─── Visual cursor feedback ───
             await cursorFocusElement(el, 'Clicking...');
             cursorClick();
+
+            // Modern SPA robust click sequence with spatial coordinates
+            const rect = el.getBoundingClientRect();
+            const clientX = rect.left + rect.width / 2;
+            const clientY = rect.top + rect.height / 2;
+            const eventOpts = { bubbles: true, cancelable: true, clientX, clientY };
+
+            el.dispatchEvent(new PointerEvent('pointerover', eventOpts));
+            el.dispatchEvent(new PointerEvent('pointerenter', eventOpts));
+            el.dispatchEvent(new PointerEvent('pointerdown', eventOpts));
+            el.dispatchEvent(new MouseEvent('mousedown', eventOpts));
+            el.dispatchEvent(new PointerEvent('pointerup', eventOpts));
+            el.dispatchEvent(new MouseEvent('mouseup', eventOpts));
             el.click();
+            el.dispatchEvent(new Event('change', { bubbles: true }));
+
             await sleep(300);
             hideCursorFeedback();
             setTimeout(() => removeAstraCursor(), 1000);
@@ -1518,18 +2276,29 @@ async function handleDOMAction(message: ExecuteDOMActionMessage) {
         case 'type': {
             if (!selector) throw new Error('type requires a selector');
             if (!value) throw new Error('type requires a value');
-            const el = document.querySelector(selector) as HTMLInputElement;
+            const el = safeQuerySelector(selector) as HTMLInputElement | HTMLTextAreaElement | null;
             if (!el) throw new Error(`Element not found: ${selector}`);
             // ─── Visual cursor feedback ───
             await cursorFocusElement(el, `Typing "${value.substring(0, 20)}${value.length > 20 ? '...' : ''}"`);
             el.focus();
-            el.value = '';
+            
+            const nativeInputValueSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')?.set;
+            const nativeTextAreaValueSetter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value')?.set;
+
+            let currentVal = '';
             for (const char of value) {
-                el.value += char;
-                el.dispatchEvent(new Event('input', { bubbles: true }));
+                currentVal += char;
+                if (el instanceof HTMLTextAreaElement && nativeTextAreaValueSetter) {
+                    nativeTextAreaValueSetter.call(el, currentVal);
+                } else if (nativeInputValueSetter) {
+                    nativeInputValueSetter.call(el, currentVal);
+                } else {
+                    el.value = currentVal;
+                }
+                el.dispatchEvent(new Event('input', { bubbles: true, composed: true }));
                 await sleep(18);
             }
-            el.dispatchEvent(new Event('change', { bubbles: true }));
+            el.dispatchEvent(new Event('change', { bubbles: true, composed: true }));
             hideCursorFeedback();
             return { success: true, data: { typed: value, into: selector } };
         }
@@ -1538,7 +2307,7 @@ async function handleDOMAction(message: ExecuteDOMActionMessage) {
             const scrollAmount = amount ?? 500;
             const dir = direction === 'up' ? -1 : 1;
             if (selector) {
-                const el = document.querySelector(selector);
+                const el = safeQuerySelector(selector);
                 if (!el) throw new Error(`Element not found: ${selector}`);
                 el.scrollBy({ top: scrollAmount * dir, behavior: 'smooth' });
             } else {
@@ -1551,6 +2320,46 @@ async function handleDOMAction(message: ExecuteDOMActionMessage) {
             const ms = duration ?? 1000;
             await sleep(ms);
             return { success: true, data: { waited: ms } };
+        }
+
+        case 'press_enter': {
+            // Press Enter on the given selector (or the currently-focused element).
+            // Used to submit search bars and single-input forms without needing to
+            // locate a separate submit button.
+            const targetEl = (selector
+                ? safeQuerySelector(selector)
+                : document.activeElement
+            ) as HTMLElement | null;
+            if (!targetEl) return { success: false, error: 'press_enter: no target element found' };
+            
+            targetEl.focus();
+            
+            // Modern SPA Enter key sequence (React/Vue/Angular require specific properties)
+            const keyOpts: KeyboardEventInit = {
+                key: 'Enter', code: 'Enter', keyCode: 13, which: 13, charCode: 13,
+                bubbles: true, cancelable: true, composed: true, view: window
+            };
+            
+            targetEl.dispatchEvent(new KeyboardEvent('keydown', keyOpts));
+            targetEl.dispatchEvent(new KeyboardEvent('keypress', keyOpts));
+            targetEl.dispatchEvent(new KeyboardEvent('keyup', keyOpts));
+            
+            // Native onChange/onInput trigger just in case
+            targetEl.dispatchEvent(new Event('input', { bubbles: true, composed: true }));
+            targetEl.dispatchEvent(new Event('change', { bubbles: true, composed: true }));
+            // For form inputs: also attempt native form submission
+            if (targetEl instanceof HTMLInputElement && targetEl.form) {
+                const submitBtn = targetEl.form.querySelector<HTMLElement>(
+                    'button[type="submit"], input[type="submit"]'
+                );
+                if (submitBtn) {
+                    submitBtn.click();
+                } else {
+                    try { targetEl.form.requestSubmit(); } catch { targetEl.form.submit(); }
+                }
+            }
+            await sleep(300);
+            return { success: true, data: { pressedEnter: selector || 'active element' } };
         }
 
         case 'search': {
@@ -1586,7 +2395,7 @@ async function handleDOMAction(message: ExecuteDOMActionMessage) {
                     'input[aria-label*="find" i]',
                 ];
                 for (const sel of searchSelectors) {
-                    const candidate = document.querySelector(sel);
+                    const candidate = safeQuerySelector(sel);
                     if (candidate && isVisible(candidate as HTMLElement)) {
                         el = candidate as HTMLInputElement;
                         break;
@@ -1595,7 +2404,12 @@ async function handleDOMAction(message: ExecuteDOMActionMessage) {
             }
 
             if (!el) {
-                throw new Error('Could not find a VISIBLE search input on this page');
+                // Instead of hard fail, return structured error so planner can adapt
+                return {
+                    success: false,
+                    error: 'No visible search input found on this page. The page may need navigation first, or search may be behind a button/icon that needs to be clicked to reveal the search bar.',
+                    data: { recoverable: true, suggestion: 'Try clicking a search icon, magnifying glass button, or navigating to the correct page first.' },
+                };
             }
 
             if (el.tagName !== 'INPUT' && el.tagName !== 'TEXTAREA') {
@@ -1691,7 +2505,7 @@ async function handleDOMAction(message: ExecuteDOMActionMessage) {
                     '[class*="search" i] [type="submit"]',
                 ];
                 for (const btnSel of searchBtnSelectors) {
-                    const btn = document.querySelector(btnSel) as HTMLElement;
+                    const btn = safeQuerySelector(btnSel) as HTMLElement | null;
                     if (btn && isVisible(btn)) {
                         btn.click();
                         break;
@@ -1728,7 +2542,7 @@ function readDOM(message: ReadDOMMessage) {
     const { selector, maxDepth = 5, includeText = true } = message.payload;
 
     const root = selector
-        ? document.querySelector(selector) ?? document.body
+        ? safeQuerySelector(selector) ?? document.body
         : document.body;
 
     const elements = extractElements(root as HTMLElement, maxDepth, includeText);

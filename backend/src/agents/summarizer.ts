@@ -49,7 +49,7 @@ async function summarize(step: AgentStep, start: number): Promise<StepResult> {
     }
 
     const prompt = `Summarize the following text in approximately ${maxLength} characters:\n\n${text}`;
-    const summary = await chat(SUMMARIZE_SYSTEM_PROMPT, prompt);
+    const summary = await chat(SUMMARIZE_SYSTEM_PROMPT, prompt, 'research');
 
     return {
         stepId: step.id,
@@ -68,7 +68,7 @@ async function bullets(step: AgentStep, start: number): Promise<StepResult> {
     }
 
     const prompt = `Create exactly ${count} bullet points summarizing the following text:\n\n${text}`;
-    const result = await chat(BULLETS_SYSTEM_PROMPT, prompt);
+    const result = await chat(BULLETS_SYSTEM_PROMPT, prompt, 'research');
 
     return {
         stepId: step.id,

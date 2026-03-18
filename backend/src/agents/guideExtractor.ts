@@ -67,7 +67,7 @@ export async function extractGuideFromContent(
 
     try {
         // Step 3: Extract guide using LLM (TOON format)
-        const rawResponse = await chat(EXTRACTION_SYSTEM_PROMPT, extractionPrompt);
+        const rawResponse = await chat(EXTRACTION_SYSTEM_PROMPT, extractionPrompt, 'research');
         const parsedGuide = parseToonToExtractionRecord(rawResponse);
 
         // Step 4: Validate and post-process

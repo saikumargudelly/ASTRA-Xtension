@@ -41,7 +41,7 @@ RULES:
 - Do NOT make up results. Only use what is in the page content.
 - If fewer than 3 results are found, say so clearly.`;
 
-    const response = await chat(systemPrompt, `Page content:\n${pageContext}`);
+    const response = await chat(systemPrompt, `Page content:\n${pageContext}`, 'research');
 
     return {
         summary: response,
@@ -99,55 +99,68 @@ Be specific about what you see in the image.`;
     const isSearchResults = prompt.toLowerCase().includes('[search results]') || prompt.toLowerCase().includes('rank and summarize');
 
     if (isSearchResults) {
-        // ─── Search Results Mode: Extract structured ranked list ───
-        const systemPrompt = `You are ASTRA, an intelligent AI research assistant analyzing a SEARCH RESULTS PAGE.
 
-The user searched for: "${prompt}"
+        // Extract price constraint from prompt (e.g., "under 20000", "below 5000", "₹3000")
+        const priceMatch = prompt.match(/(under|below|within|max|upto|up to|less than)[\s₹rs.]*([\d,]+)/i)
+            || prompt.match(/([\d,]+)[\s₹rs]*(max|or less|and below)/i);
+        const priceLimit = priceMatch
+            ? parseInt((priceMatch[2] || priceMatch[1]).replace(/,/g, ''), 10)
+            : null;
 
+        const systemPrompt = `You are NEXUS, an intelligent AI shopping assistant analyzing a SEARCH RESULTS PAGE for the user's query.
+
+The user asked: "${prompt}"
+${priceLimit ? `
+⚠️  STRICT BUDGET RULE: The user has a budget of ₹${priceLimit.toLocaleString('en-IN')}.
+- YOU MUST EXCLUDE any item whose price exceeds ₹${priceLimit.toLocaleString('en-IN')}.
+- DO NOT include ₹100, ₹200, ₹500 items just because they are "under budget" — the budget is a MAXIMUM, not a target.
+- Focus on items that represent good value CLOSE TO or AT the budget (e.g., for ₹20,000 budget, prioritize ₹5,000–₹20,000 items).
+- Entirely exclude items below ₹500 unless the user explicitly asked for cheap/economical gifts.
+` : ''}
 Your job:
-1. Extract ALL visible result items (courses, posts, products, articles, videos, etc.) from the page content.
-2. For EACH result extract: title, URL (if present), rating/stars/score, review count, short description.
-3. Rank them by: RELEVANCE to the query + POPULARITY (ratings, reviews, enrollments, upvotes).
-4. Return the TOP 8 results.
-5. Assign a badge to the top items: "🏆 Best Match", "⭐ Highest Rated", "🔥 Most Popular", "💎 ASTRA Pick".
+1. Extract ALL visible product items from the page content (titles, prices, URLs, ratings).
+2. If a price is visible, verify it is within the budget. SKIP items that exceed the budget.
+3. Prioritize items priced between ${priceLimit ? `₹${Math.round(priceLimit * 0.1).toLocaleString('en-IN')} and ₹${priceLimit.toLocaleString('en-IN')}` : 'a reasonable range'}.
+4. Rank by: RELEVANCE + RATING + VALUE FOR MONEY.
+5. Return TOP 8 results.
+6. Assign badges: "🏆 Best Choice", "⭐ Highest Rated", "💎 Best Value", "🎁 Gift Pick".
 
 PAGE CONTENT:
 ${pageContext}
 
-OUTPUT FORMAT — you MUST return your response in this exact structure:
+OUTPUT FORMAT — return exactly this structure:
 
-## 🎯 ASTRA's Top Picks for "[query]"
+## 🎯 NEXUS Picks for "${priceLimit ? `budget ₹${priceLimit.toLocaleString('en-IN')}` : 'your query'}"
 
-[Markdown summary of top 3-5 results with descriptions]
+[Short markdown summary of top 3-5 results with why they fit the criteria]
 
 ---
-💡 **ASTRA's Take:** [2-sentence synthesis of what the best options are and why]
+💡 **NEXUS Verdict:** [2-sentence synthesis — best overall pick and why]
 
 [RESULTS_TOON]
 rank: 1
-title: Exact title of the result as shown on page
-url: URL if visible
-rating: 4.8 stars or 94% positive or null
-reviewCount: 12,400 reviews or null
+title: Exact product title from page
+url: Product URL if visible
+price: ₹X,XXX (if visible on page)
+rating: 4.5 ⭐ (1,234 reviews) or null
+reviewCount: 1,234 or null
 snippet: 1-2 sentence description
-reason: Why ASTRA ranked this #1
-badge: 🏆 Best Match
+reason: Why NEXUS ranked this #1 for this budget
+badge: 🏆 Best Choice
 ---
 rank: 2
-title: Second result title
-url: ...
+...
 [/RESULTS_TOON]
 
 CRITICAL RULES:
-1. Extract EXACT titles as they appear on the page - do not paraphrase.
-2. DO NOT concatenate the brand name with the product name. If the brand and product name are separate text blocks on the page, ONLY return the exact product name (e.g., if the page says "Puma" and "Men's Sneaker", return ONLY "Men's Sneaker" as the title).
-3. Only include results that are actually visible in the page content
-4. Rank by combining relevance to query AND popularity metrics
-4. The badge should reflect WHY this result is recommended
-5. The reason field should explain the ranking decision`;
+1. ONLY include items within the budget. Exclude anything over ₹${priceLimit?.toLocaleString('en-IN') ?? 'stated budget'}.
+2. Do NOT include gift wrap items, accessories, or non-product entries.
+3. Extract EXACT titles as shown — do not paraphrase or combine brand + product.
+4. The price field MUST be extracted if visible — this is how we verify budget compliance.
+5. Rank by relevance + rating + value.`;
 
-        const response = await chat(systemPrompt, `Analyze these search results and return ranked list:\n\n${pageContext}`);
-        console.log('[ASTRA] Raw LLM text:', response.substring(0, 1000) + '...');
+        const response = await chat(systemPrompt, `Analyze these search results, enforce the budget, and return ranked list:\n\n${pageContext}`, 'research');
+        console.log('[NEXUS] Raw LLM text:', response.substring(0, 1000) + '...');
 
         // Parse the [RESULTS_TOON] block
         let rankedResults: Array<{
@@ -210,30 +223,26 @@ CRITICAL RULES:
             console.log('[ASTRA] first result sample:', rankedResults[0]);
         }
 
-        // Return results even if JSON parsing failed - the summary still contains useful info
         return { summary, rankedResults };
     }
 
     // 4. Regular page analysis / summarization
-    const systemPrompt = `You are ASTRA, an intelligent browser automation assistant. You have been given the full content of a web page that was captured by scrolling through it and extracting text, structure, and metadata.
+    const regularSystemPrompt = `You are NEXUS, an intelligent browser automation assistant. You have full access to the page content captured by scrolling.
 
-Your task is to analyze the page content and respond to the user's request. Be comprehensive, specific, and cite relevant details from the page.
+Your task: analyze the page content and respond to the user's request.
 
 PAGE CONTEXT:
 ${pageContext}
 
-${screenshot ? '(A screenshot of the page was also captured for reference, though I am analyzing the text content here.)' : ''}
+${screenshot ? '(A screenshot was also captured.)' : ''}
 
 INSTRUCTIONS:
-- Answer the user's question or fulfill their request based on the page content above
-- If asked to summarize, provide a clear and organized summary
-- If asked to find specific information, locate and present it
-- If asked to analyze, provide insights based on the content
-- Use headings, bullet points, and structure for readability
-- If the page content doesn't contain the answer, say so clearly`;
+- Answer based on page content
+- Use headings and bullet points for readability
+- If the page doesn't have the answer, say so clearly`;
 
-    const response = await chat(systemPrompt, prompt);
-    return { summary: response };
+    const regularResponse = await chat(regularSystemPrompt, prompt, 'research');
+    return { summary: regularResponse };
 }
 
 // ─── Build a text representation of the page data ───
@@ -365,7 +374,7 @@ export async function matchFiltersToConstraints(
     ).join('\n');
     console.log(`[ASTRA] RAW INBOUND FILTERS (${availableFilters.length} items):\n`, filtersDesc);
 
-    const systemPrompt = `You are ASTRA's Filter Intelligence agent. Your job is to analyze a user's search query and decide which page filters/sorts to apply to get the best results.
+    const systemPrompt = `You are NEXUS's Filter Intelligence agent. Your job is to pick the correct page filters for the user's shopping query.
 
 USER QUERY: "${userQuery}"
 
@@ -373,36 +382,44 @@ AVAILABLE FILTERS ON THE PAGE:
 ${filtersDesc}
 
 INSTRUCTIONS:
-1. Extract any constraints from the user query (time limits, rating requirements, price, level, date ranges, sort preferences).
-2. Match those constraints to the available filters above.
-3. If the user mentions "best", "highest rated", "most popular" — look for a sort/rating filter.
-4. If the user mentions a duration like "under 10 hours", "short courses" — look for a duration filter.
-5. If the user mentions "free", "paid", price — look for a price filter.
-6. If the user mentions "beginner", "advanced" — look for a level filter.
-7. Only select filters that are CLEARLY relevant. Don't apply filters that don't match the query.
-8. [CRITICAL] If the user specifies a maximum boundary (e.g., "under 2000" or "under 10 hours") and the page offers multiple smaller bracket filters (like "0-500", "500-1000", "1000-2000"), you MUST return ALL of the valid bracket filters that fit within the user's limit, not just the lowest one!
+1. Extract constraints from the user's query: price limit, rating requirement, sort preference.
+2. Match those constraints to ACTUAL FILTER WIDGETS — checkboxes, sliders, select dropdowns, radio buttons.
 
-OUTPUT FORMAT — TOON only (Token-Oriented Object Notation):
-Do not use JSON formatting (no braces, no quotes around keys).
-Use this exact bracketed section format:
+⚠️  CRITICAL — DO NOT click these types of elements:
+- Search suggestion links (e.g., "best wedding gifts under 20000 rs" as a link → this would re-search, not filter!)
+- Navigation links, category links, autocomplete suggestions
+- Any [link] type filter where the label looks like an auto-suggest (contains the full query text)
+
+✅  DO click:
+- Price range checkboxes or sliders ("₹0–₹5000", "₹5000–₹10000", etc.)
+- Sort options ("Price -- Low to High", "Popularity", "Rating")
+- Brand checkboxes
+- Rating filters ("4★ & above" etc.)
+
+3. For a budget constraint like "under 20000", select ALL price brackets that fit within that limit.
+   Example: if available are "₹0-5000", "₹5000-10000", "₹10000-20000" — select all 3.
+4. Always add a relevance/popularity sort if the user says "best" or doesn't specify.
+5. Only return filters with type = "checkbox", "select", "radio", "range" — NEVER type = "link".
+
+OUTPUT FORMAT — TOON only:
 
 [CONSTRAINTS]
+price under ${userQuery.match(/(\d[\d,]+)/)?.[0] ?? 'stated limit'}
 highest rated
-under 10 hours
 [/CONSTRAINTS]
 [FILTERS]
-selector:#sort-by-rating | label:Sort by Rating | reason:User wants highest rated
-selector:[data-filter="duration-short"] | label:0-3 Hours | reason:User wants short courses
+selector:#price-range-0-5000 | label:₹0–₹5000 | reason:Within user budget
+selector:#sort-popularity | label:Sort by Popularity | reason:User wants best results
 [/FILTERS]
 
 RULES:
-- Return EMPTY sections if no constraints match any available filter.
-- Use the EXACT selector from the available filters list.
-- Maximum 5 filters to avoid over-filtering.
-- If no constraints are detected in the query, return empty arrays.`;
+- Maximum 5 filters.
+- EXACT selector from the list above.
+- Skip any filter of type [link].
+- Return EMPTY sections if no real filter widgets match.`;
 
     try {
-        const response = await chat(systemPrompt, 'Analyze the query and return filter selections in TOON format.');
+        const response = await chat(systemPrompt, 'Analyze the query and return filter selections in TOON format.', 'research');
         console.log('[ASTRA] Extracted Filters TOON:\n', response);
 
         const extractedConstraints: string[] = [];

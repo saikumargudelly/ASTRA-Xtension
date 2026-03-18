@@ -1,8 +1,8 @@
 {
-  "name": "astra-xtension",
-  "version": "0.1.0",
+  "name": "nexus-workspace",
+  "version": "1.0.0",
   "private": true,
-  "description": "ASTRA – Multi-Agent Browser Automation Assistant",
+  "description": "NEXUS – Next-Generation Extensible Universal Assistant",
   "workspaces": [
     "extension",
     "backend"
@@ -11,6 +11,10 @@
     "dev:ext": "npm run dev --workspace=extension",
     "dev:backend": "npm run dev --workspace=backend",
     "build:ext": "npm run build --workspace=extension",
-    "build:backend": "npm run build --workspace=backend"
+    "build:backend": "npm run build --workspace=backend",
+    "infra:up": "docker compose up -d",
+    "infra:down": "docker compose down",
+    "infra:logs": "docker compose logs -f",
+    "start": "concurrently \"npm run dev:backend\" \"npm run dev:ext\""
   }
 }

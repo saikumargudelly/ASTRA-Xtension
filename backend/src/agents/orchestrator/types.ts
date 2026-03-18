@@ -2,6 +2,7 @@
 // Type definitions for the Orchestrator Agent
 
 import type { AgentStep, StepResult } from '../../types/index.js';
+import type { ErrorClass } from './errorTaxonomy.js';
 
 // ─── Execution Groups ───
 

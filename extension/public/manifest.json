@@ -9,8 +9,10 @@
         "128": "icons/icon128.png"
     },
     "action": {
-        "default_popup": "src/popup/index.html",
         "default_title": "ASTRA"
+    },
+    "side_panel": {
+        "default_path": "src/popup/index.html"
     },
     "background": {
         "service_worker": "src/background/index.ts",
@@ -31,7 +33,11 @@
         "activeTab",
         "tabs",
         "scripting",
-        "storage"
+        "storage",
+        "bookmarks",
+        "downloads",
+        "webRequest",
+        "sidePanel"
     ],
     "host_permissions": [
         "<all_urls>"

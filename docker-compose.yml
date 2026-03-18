@@ -1,0 +1,66 @@
+version: '3.9'
+
+# ─── NEXUS Local Infrastructure ───────────────────────────────────────────────
+# Run with: docker compose up -d
+# Stop with: docker compose down
+# Wipe data:  docker compose down -v
+
+services:
+
+  # ── Tier 3 Memory: PostgreSQL 16 + pgvector ──────────────────────────────────
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: nexus-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: nexus
+      POSTGRES_PASSWORD: nexus
+      POSTGRES_DB: nexus
+    ports:
+      - "5432:5432"
+    volumes:
+      - nexus_postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U nexus -d nexus"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ── Tier 1 Memory: Redis 7 ────────────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    container_name: nexus-redis
+    restart: unless-stopped
+    command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru
+    ports:
+      - "6379:6379"
+    volumes:
+      - nexus_redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ── Tier 2 Memory: ChromaDB ───────────────────────────────────────────────────
+  chroma:
+    image: chromadb/chroma:latest
+    container_name: nexus-chroma
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    volumes:
+      - nexus_chroma_data:/chroma/chroma
+    environment:
+      IS_PERSISTENT: "TRUE"
+      ANONYMIZED_TELEMETRY: "FALSE"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8000/api/v1/heartbeat || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+
+volumes:
+  nexus_postgres_data:
+  nexus_redis_data:
+  nexus_chroma_data:

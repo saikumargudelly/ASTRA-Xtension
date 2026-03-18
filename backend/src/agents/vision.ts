@@ -197,6 +197,7 @@ totalResultsFound: N
 rank:1 | title:... | description:... | url:... | score:...
 [/TOP_RESULTS]`,
             `Page content:\n${pageText.substring(0, 2500)}\n\nReturn TOON output.`,
+            'research',
         );
 
         try {
@@ -239,7 +240,80 @@ rank:1 | title:... | description:... | url:... | score:...
     };
 }
 
-// ─── 3. Format Results for Display ───
+// ─── 3. Vision Element Mapper ──────────────────────────────────────────────────────────────
+// Receives screenshot + list of DOM elements detected by the browser.
+// The Vision model maps each DOM element to what it visually looks like on screen.
+// Gives the planner ACCURATE visual descriptions (e.g. "idx 1 is the magnifying-glass
+// search-submit button at top right") instead of raw DOM label text.
+
+export interface VisionElement {
+    domIdx: number;    // Matches InteractiveElement.idx
+    confidence: number;  // 0-100
+    visualRole: string;  // e.g. "large search input bar at top center"
+}
+
+export async function identifyElements(
+    screenshot: string,
+    elements: Array<{ idx: number; type: string; label: string }>,
+    query: string,
+): Promise<VisionElement[]> {
+    if (!screenshot || !elements.length) return [];
+
+    const elementLines = elements
+        .slice(0, 30)
+        .map(e => `idx:${e.idx} | type:${e.type} | label:${e.label}`)
+        .join('\n');
+
+    const systemPrompt = `You are ASTRA's Vision Element Mapper.
+You see a browser screenshot AND a list of DOM elements found by the browser crawler.
+Your task: look at the screenshot and identify WHICH DOM elements you can actually SEE and what they visually look like.
+
+DOM ELEMENTS:
+${elementLines}
+
+For each element you can visually locate in the screenshot, output one line:
+  idx:N | confidence:0-100 | role:visual description (e.g. "main search text field at top of page")
+
+RULES:
+- Only output elements you are CONFIDENT are visible in the screenshot
+- Be specific: "white search bar spanning top header" not just "input"
+- Pay special attention to: submit/search BUTTONS that sit next to text inputs (often a magnifying glass icon)
+- confidence below 60 = skip that element
+
+Output ONLY the [VISION_ELEMENTS] block:
+[VISION_ELEMENTS]
+idx:0 | confidence:98 | role:white search text field at top center, empty placeholder text visible
+idx:1 | confidence:95 | role:blue search submit button (magnifying glass icon) immediately to the right of the search bar
+[/VISION_ELEMENTS]`;
+
+    try {
+        const response = await chatVision(
+            systemPrompt,
+            `User wants to: "${query}". Identify visible DOM elements in this screenshot.`,
+            screenshot,
+        );
+
+        const result: VisionElement[] = [];
+        const blockMatch = response.match(/\[VISION_ELEMENTS\]([\s\S]*?)\[\/VISION_ELEMENTS\]/i);
+        if (!blockMatch) return [];
+
+        for (const line of blockMatch[1].split('\n').map(l => l.trim()).filter(Boolean)) {
+            const parts = line.split('|').map(p => p.trim());
+            let idx = -1, confidence = 0, role = '';
+            for (const p of parts) {
+                if (p.toLowerCase().startsWith('idx:')) idx = parseInt(p.slice(4).trim(), 10);
+                else if (p.toLowerCase().startsWith('confidence:')) confidence = parseInt(p.slice(11).trim(), 10) || 0;
+                else if (p.toLowerCase().startsWith('role:')) role = p.slice(5).trim();
+            }
+            if (idx >= 0 && role && confidence >= 60) result.push({ domIdx: idx, confidence, visualRole: role });
+        }
+        return result;
+    } catch {
+        return [];
+    }
+}
+
+// ─── 4. Format Results for Display ───
 // Converts structured results into a clean markdown summary for the user.
 export function formatResultsMarkdown(results: ResultsAnalysis, query: string): string {
     const lines: string[] = [];

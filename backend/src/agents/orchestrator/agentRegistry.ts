@@ -45,6 +45,14 @@ const AGENT_DEFINITIONS: Record<string, { actions: string[]; description: string
     actions: ['generate_walkthrough'],
     description: 'Creates interactive walkthroughs from guides',
   },
+  webResearch: {
+    actions: ['research', 'search_docs', 'fetch_page'],
+    description: 'Performs live web research — searches DuckDuckGo and fetches page content to ground navigation/config answers',
+  },
+  pageIntelligence: {
+    actions: ['parse_intent', 'plan_actions'],
+    description: 'Parses natural-language intent into structured constraints and plans concrete DOM actions against a live browser snapshot',
+  },
 };
 
 // ─── Registry Class ───

@@ -8,7 +8,11 @@ import { memoryRoutes } from './routes/memory.js';
 import { analyzeRoutes } from './routes/analyze.js';
 import { configRoutes } from './routes/config.js';
 import { orchestrateRoutes } from './routes/orchestrate.js';
+import { chatRoutes } from './routes/chat.js';
+import { planActionsRoute } from './routes/planActions.js';
 import { getDb, closeDb } from './db/sqlite.js';
+import { closeRedis } from './db/redis.js';
+import { closePostgres, migrateSchema } from './db/postgres.js';
 
 const PORT = Number(process.env.PORT) || 3001;
 const HOST = process.env.HOST || '0.0.0.0';
@@ -36,12 +40,19 @@ async function start() {
     // ─── Health Check ───
     app.get('/health', async () => ({
         status: 'ok',
-        service: 'astra-backend',
-        version: '0.1.0',
+        service: 'nexus-backend',
+        version: '1.0.0',
+        features: {
+            streaming: true,
+            multiLLM: true,
+            reactLoop: true,
+            memory3Tier: true,
+            critic: true,
+        },
         timestamp: new Date().toISOString(),
     }));
 
-    // ─── Routes ───
+    // ─── Routes (existing ASTRA — backward compatible) ───
     await app.register(intentRoutes);
     await app.register(executeRoutes);
     await app.register(summarizeRoutes);
@@ -50,14 +61,28 @@ async function start() {
     await app.register(configRoutes);
     await app.register(orchestrateRoutes);
 
-    // ─── Initialize Database ───
+    // ─── NEXUS New Routes ───
+    await app.register(chatRoutes);
+    await app.register(planActionsRoute);
+
+    // ─── Initialize Databases ───
+    // SQLite (existing — always available)
     getDb();
-    console.log('[ASTRA] SQLite database initialized');
+    console.log('[NEXUS] SQLite database initialized');
+
+    // PostgreSQL + pgvector (Tier 3 — optional, degrades gracefully)
+    await migrateSchema();
+
+    // Redis (Tier 1 — optional, degrades gracefully)
+    // Redis connection is lazy — it connects on first use via getRedis()
+    console.log('[NEXUS] Memory stack: SQLite ✓ | PostgreSQL (connecting...) | Redis (lazy)');
 
     // ─── Graceful Shutdown ───
     const shutdown = async () => {
-        console.log('[ASTRA] Shutting down...');
+        console.log('[NEXUS] Shutting down...');
         closeDb();
+        await closeRedis();
+        await closePostgres();
         await app.close();
         process.exit(0);
     };
@@ -68,7 +93,9 @@ async function start() {
     // ─── Start Server ───
     try {
         await app.listen({ port: PORT, host: HOST });
-        console.log(`\n  ⚡ ASTRA Backend running at http://${HOST}:${PORT}\n`);
+        console.log(`\n  ⚡ NEXUS Backend running at http://${HOST}:${PORT}`);
+        console.log(`  📡 Streaming endpoint: POST http://${HOST}:${PORT}/chat`);
+        console.log(`  🔄 Legacy ASTRA routes still active for Chrome extension\n`);
     } catch (err) {
         app.log.error(err);
         process.exit(1);

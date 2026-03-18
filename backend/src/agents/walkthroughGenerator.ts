@@ -76,7 +76,7 @@ async function enhanceWithLLM(
     const prompt = buildEnhancementPrompt(guide, userQuery);
 
     try {
-        const rawResponse = await chat(WALKTHROUGH_SYSTEM_PROMPT, prompt);
+        const rawResponse = await chat(WALKTHROUGH_SYSTEM_PROMPT, prompt, 'planning');
         const enhanced = parseToonToWalkthroughRecord(rawResponse);
 
         const steps = parseSteps(enhanced.steps as Record<string, unknown>[]);

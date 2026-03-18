@@ -1,54 +1,103 @@
+// ─── NEXUS LLM Service ────────────────────────────────────────────────────────
+// Unified LLM interface that routes through the LLM Router.
+// Maintains backward-compatibility with the existing chat() / chatVision() API
+// used by all existing agents (planner, analyzer, etc.).
+
 import 'dotenv/config';
 import type { LLMMessage, LLMResponse } from '../types/index.js';
+import { getLLMRouter, type TaskType, type RouterConstraints } from '../llm/router.js';
+import type { StreamEvent } from '../llm/streaming.js';
 
-// ─── Groq Configuration ───
-const GROQ_API_URL = process.env.GROQ_API_URL || 'https://api.groq.com/openai/v1/chat/completions';
-const GROQ_API_KEY = process.env.GROQ_API_KEY || '';
-const GROQ_API_KEY_2 = process.env.GROQ_API_KEY_2 || '';
-const GROQ_MODEL = process.env.GROQ_MODEL || 'openai/gpt-oss-120b';
-
-// ─── Fireworks.ai Configuration (For Vision) ───
-const QWEN_API_URL = process.env.QWEN_API_URL || 'https://api.fireworks.ai/inference/v1/chat/completions';
-const QWEN_API_KEY = process.env.QWEN_API_KEY || '';
-const MAX_RETRIES = 3;
-const TIMEOUT_MS = 30000;
-const VISION_MODEL = process.env.VISION_MODEL || 'accounts/fireworks/models/qwen3-vl-30b-a3b-instruct';
-
-// Global state to persist key swaps across different API routes entirely
-let activeApiKey = GROQ_API_KEY;
-
-if (!GROQ_API_KEY) {
-    console.warn('[ASTRA] ⚠ GROQ_API_KEY is not set. Add your Groq API key to backend/.env');
-}
-if (!QWEN_API_KEY && VISION_MODEL.includes('fireworks')) {
-    console.warn('[ASTRA] ⚠ QWEN_API_KEY is not set. Add your Fireworks API key to backend/.env for Vision');
+// ─── Helpers ───────────────────────────────────────────────────────────────────
+function stripThinkTags(text: string): string {
+    let stripped = text.replace(/<think>[\s\S]*?<\/think>\s*/gi, '').trim();
+    // Unclosed <think> (e.g. Groq/Llama): remove from <think> to next [REASONING]/[ACTIONS]/[NOTES] or end
+    const unclosed = stripped.search(/<think>/i);
+    if (unclosed >= 0) {
+        const tail = stripped.slice(unclosed);
+        const next = tail.search(/\n\s*\[(REASONING|ACTIONS|NOTES)\]/i);
+        stripped = (next >= 0 ? stripped.slice(0, unclosed) + tail.slice(next) : stripped.slice(0, unclosed)).trim();
+    }
+    return stripped || text.trim();
 }
 
-// ─── Chat (raw text response) ───
+// ─── Dispatch to correct provider ─────────────────────────────────────────────
+async function dispatchChat(
+    messages: LLMMessage[],
+    taskType: TaskType = 'simple-qa',
+    constraints: RouterConstraints = {},
+): Promise<LLMResponse> {
+    const router = getLLMRouter();
+    const config = router.route(taskType, constraints);
+
+    console.log(`[LLMRouter] Routing '${taskType}' → ${config.provider}/${config.model}`);
+
+    try {
+        switch (config.provider) {
+            case 'groq': {
+                const { chat } = await import('../llm/providers/groq.js');
+                return await chat(messages, config.model, config.maxTokens, config.temperature);
+            }
+            case 'anthropic': {
+                const { chat } = await import('../llm/providers/anthropic.js');
+                return await chat(messages, config.model, config.maxTokens, config.temperature);
+            }
+            case 'openai': {
+                const { chat } = await import('../llm/providers/openai.js');
+                return await chat(messages, config.model, config.maxTokens, config.temperature);
+            }
+            case 'ollama': {
+                const { chat } = await import('../llm/providers/ollama.js');
+                return await chat(messages, config.model, config.maxTokens, config.temperature);
+            }
+            default: {
+                // fireworks fallback
+                const { chat } = await import('../llm/providers/fireworks.js');
+                return await chat(messages, config.model, config.maxTokens, config.temperature);
+            }
+        }
+    } catch (err) {
+        // Mark provider unavailable, retry with fallback
+        router.markProviderUnavailable(config.provider);
+        console.warn(`[LLMRouter] ${config.provider} failed, using fallback`);
+
+        const fallbackConfig = router.route(taskType, constraints);
+        if (fallbackConfig.provider === config.provider) {
+            throw err; // No different fallback available
+        }
+
+        const { chat } = await import(`../llm/providers/${fallbackConfig.provider}.js`);
+        return await chat(messages, fallbackConfig.model, fallbackConfig.maxTokens);
+    }
+}
+
+// ─── Backward-Compatible API ───────────────────────────────────────────────────
+
+/**
+ * Simple chat — used by planner, analyzer, summarizer.
+ * Routes to the cheapest / fastest model unless overridden.
+ */
 export async function chat(
     systemPrompt: string,
     userPrompt: string,
+    taskType: TaskType = 'simple-qa',
 ): Promise<string> {
     const messages: LLMMessage[] = [
         { role: 'system', content: systemPrompt },
         { role: 'user', content: userPrompt },
     ];
-
-    // ASTRA generic chat function maps standard OpenAI format
-    const response = await callGroq(messages);
+    const response = await dispatchChat(messages, taskType);
     return stripThinkTags(response.content);
 }
 
-// ─── Chat with Vision ───
+/**
+ * Vision chat — routes to GPT-4o or Fireworks vision model.
+ */
 export async function chatVision(
     systemPrompt: string,
     userPrompt: string,
     imageUrl: string,
 ): Promise<string> {
-    if (!VISION_MODEL) {
-        throw new Error('VISION_MODEL is not configured in .env');
-    }
-
     const messages: LLMMessage[] = [
         { role: 'system', content: systemPrompt },
         {
@@ -59,207 +108,61 @@ export async function chatVision(
             ],
         },
     ];
-
-    // Vision requests map directly as standard multimodal payloads
-    const response = await callQwen(messages, VISION_MODEL);
+    const response = await dispatchChat(messages, 'vision');
     return stripThinkTags(response.content);
 }
 
-// ─── Chat JSON removed. ASTRA-Xtension migrated to TOON ───
-
-// ─── Strip <think> tags (Legacy Qwen Support) ───
-function stripThinkTags(text: string): string {
-    // Left as a safety net if deepseek/qwen reasoning models are used on groq
-    const stripped = text.replace(/<think>[\s\S]*?<\/think>\s*/g, '').trim();
-    return stripped || text.trim();
+/**
+ * Full message array chat — used by the coordinator/ReAct loop.
+ */
+export async function chatMessages(
+    messages: LLMMessage[],
+    taskType: TaskType = 'planning',
+    constraints: RouterConstraints = {},
+): Promise<LLMResponse> {
+    return dispatchChat(messages, taskType, constraints);
 }
 
-// ─── Core Groq API Call ───
-async function callGroq(
+/**
+ * Streaming chat — yields StreamEvent tokens in real time.
+ */
+export async function* chatStream(
     messages: LLMMessage[],
-    modelOverride?: string,
-    options?: {
-        maxTokens?: number;
-        temperature?: number;
-    },
-): Promise<LLMResponse> {
-    let lastError: Error | null = null;
-    const model = modelOverride || GROQ_MODEL;
-    const maxTokens = options?.maxTokens ?? 4096;
-    const temperature = options?.temperature ?? 0.7;
+    taskType: TaskType = 'planning',
+    constraints: RouterConstraints = {},
+): AsyncGenerator<StreamEvent> {
+    const router = getLLMRouter();
+    const config = router.route(taskType, constraints);
 
-    for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
-        try {
-            const controller = new AbortController();
-            const timeout = setTimeout(() => controller.abort(), TIMEOUT_MS);
+    console.log(`[LLMRouter] Streaming '${taskType}' → ${config.provider}/${config.model}`);
 
-            const requestBody: Record<string, unknown> = {
-                model,
-                messages,
-                temperature,
-                max_tokens: maxTokens,
-            };
-
-            let res = await fetch(GROQ_API_URL, {
-                method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json',
-                    'Authorization': `Bearer ${activeApiKey}`,
-                    'Accept': 'application/json',
-                },
-                body: JSON.stringify(requestBody),
-                signal: controller.signal,
-            });
-
-            clearTimeout(timeout);
-
-            if (!res.ok) {
-                if ((res.status === 429 || res.status === 413) && activeApiKey === GROQ_API_KEY && GROQ_API_KEY_2) {
-                    console.warn(`[ASTRA] Groq limits hit via ${res.status}. Globally swapping to backup API key (GROQ_API_KEY_2)...`);
-                    activeApiKey = GROQ_API_KEY_2;
-
-                    // Immediately retry within the same attempt loop bounds to prevent failure escalations
-                    const fallbackController = new AbortController();
-                    const fallbackTimeout = setTimeout(() => fallbackController.abort(), TIMEOUT_MS);
-
-                    res = await fetch(GROQ_API_URL, {
-                        method: 'POST',
-                        headers: {
-                            'Content-Type': 'application/json',
-                            'Authorization': `Bearer ${activeApiKey}`, // now uses Key 2 natively
-                            'Accept': 'application/json',
-                        },
-                        body: JSON.stringify(requestBody),
-                        signal: fallbackController.signal,
-                    });
-
-                    clearTimeout(fallbackTimeout);
-                }
-
-                if (!res.ok) {
-                    const body = await res.text();
-                    const apiErr = `Groq API ${res.status}: ${body.substring(0, 300)}`;
-                    console.error(`[ASTRA] LLM attempt ${attempt} failed:`, apiErr);
-                    throw new Error(apiErr);
-                }
-            }
-
-            const data = await res.json() as {
-                choices: Array<{ message: { content: string } }>;
-                usage?: { prompt_tokens: number; completion_tokens: number; total_tokens: number };
-            };
-
-            const content = data.choices?.[0]?.message?.content ?? '';
-            const usage = data.usage;
-
-            if (!content) {
-                throw new Error('Empty response from LLM');
-            }
-
-            console.log(`[ASTRA] LLM ok (attempt ${attempt}, ${usage?.total_tokens ?? '?'} tokens)`);
-
-            return {
-                content,
-                tokensUsed: {
-                    prompt: usage?.prompt_tokens ?? 0,
-                    completion: usage?.completion_tokens ?? 0,
-                    total: usage?.total_tokens ?? 0,
-                },
-            };
-        } catch (err) {
-            lastError = err instanceof Error ? err : new Error(String(err));
-
-            if (attempt < MAX_RETRIES) {
-                const delay = Math.min(1500 * attempt, 5000);
-                console.warn(`[ASTRA] LLM attempt ${attempt} failed, retrying in ${delay}ms:`, lastError.message);
-                await new Promise((resolve) => setTimeout(resolve, delay));
-            }
+    switch (config.provider) {
+        case 'groq': {
+            const { chatStream } = await import('../llm/providers/groq.js');
+            yield* chatStream(messages, config.model, config.maxTokens);
+            break;
+        }
+        case 'anthropic': {
+            const { chatStream } = await import('../llm/providers/anthropic.js');
+            yield* chatStream(messages, config.model, config.maxTokens);
+            break;
+        }
+        case 'openai': {
+            const { chatStream } = await import('../llm/providers/openai.js');
+            yield* chatStream(messages, config.model, config.maxTokens);
+            break;
+        }
+        case 'ollama': {
+            const { chatStream } = await import('../llm/providers/ollama.js');
+            yield* chatStream(messages, config.model);
+            break;
+        }
+        default: {
+            const { chatStream } = await import('../llm/providers/fireworks.js');
+            yield* chatStream(messages, config.model, config.maxTokens);
+            break;
         }
     }
-
-    throw new Error(`Groq API failed after ${MAX_RETRIES} attempts: ${lastError?.message}`);
 }
 
-// ─── Core Fireworks.ai API Call (For Vision) ───
-async function callQwen(
-    messages: LLMMessage[],
-    modelOverride?: string,
-    options?: {
-        maxTokens?: number;
-        temperature?: number;
-    },
-): Promise<LLMResponse> {
-    let lastError: Error | null = null;
-    const model = modelOverride || VISION_MODEL;
-    const maxTokens = options?.maxTokens ?? 4096;
-    const temperature = options?.temperature ?? 0.7;
-
-    for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
-        try {
-            const controller = new AbortController();
-            const timeout = setTimeout(() => controller.abort(), TIMEOUT_MS);
-
-            const requestBody: Record<string, unknown> = {
-                model,
-                messages,
-                temperature,
-                max_tokens: maxTokens,
-            };
-
-            const res = await fetch(QWEN_API_URL, {
-                method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json',
-                    'Authorization': `Bearer ${QWEN_API_KEY}`,
-                    'Accept': 'application/json',
-                },
-                body: JSON.stringify(requestBody),
-                signal: controller.signal,
-            });
-
-            clearTimeout(timeout);
-
-            if (!res.ok) {
-                const body = await res.text();
-                const apiErr = `Fireworks API ${res.status}: ${body.substring(0, 300)}`;
-                console.error(`[ASTRA] Vision attempt ${attempt} failed:`, apiErr);
-                throw new Error(apiErr);
-            }
-
-            const data = await res.json() as {
-                choices: Array<{ message: { content: string } }>;
-                usage?: { prompt_tokens: number; completion_tokens: number; total_tokens: number };
-            };
-
-            const content = data.choices?.[0]?.message?.content ?? '';
-            const usage = data.usage;
-
-            if (!content) {
-                throw new Error('Empty response from Vision LLM');
-            }
-
-            console.log(`[ASTRA] Vision ok (attempt ${attempt}, ${usage?.total_tokens ?? '?'} tokens)`);
-
-            return {
-                content,
-                tokensUsed: {
-                    prompt: usage?.prompt_tokens ?? 0,
-                    completion: usage?.completion_tokens ?? 0,
-                    total: usage?.total_tokens ?? 0,
-                },
-            };
-        } catch (err) {
-            lastError = err instanceof Error ? err : new Error(String(err));
-
-            if (attempt < MAX_RETRIES) {
-                const delay = Math.min(1500 * attempt, 5000);
-                console.warn(`[ASTRA] Vision attempt ${attempt} failed, retrying in ${delay}ms:`, lastError.message);
-                await new Promise((resolve) => setTimeout(resolve, delay));
-            }
-        }
-    }
-
-    throw new Error(`Fireworks API failed after ${MAX_RETRIES} attempts: ${lastError?.message}`);
-}
-
-console.log(`[ASTRA] LLM service ready (${GROQ_MODEL} / ${VISION_MODEL.split('/').pop()})`);
+console.log('[NEXUS] LLM service ready — multi-provider routing active');

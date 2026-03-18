@@ -11,6 +11,7 @@ import type {
 } from './types.js';
 import { DEFAULT_EXECUTION_OPTIONS } from './types.js';
 import { getAgentRegistry } from './agentRegistry.js';
+import { classifyError, shouldRetry, formatErrorForLLM } from './errorTaxonomy.js';
 
 // ─── Agent Imports ───
 import { executeBrowserStep } from '../browser.js';
@@ -19,6 +20,8 @@ import { executeMemoryStep } from '../memory.js';
 import { handleConfigRequest } from '../config.js';
 import { analyzePageContent, analyzeSearchResults, matchFiltersToConstraints } from '../analyzer.js';
 import { analyzeScreen, analyzeResults } from '../vision.js';
+import { performWebResearch } from '../webResearch.js';
+import { parseUserIntent, planPageActions } from '../pageIntelligence.js';
 
 // ─── Agent Executor Map ───
 
@@ -38,6 +41,41 @@ const agentExecutors: Record<string, AgentExecutor> = {
       data: result,
       durationMs: 0,
     };
+  },
+  // ─── Web Research Agent ───────────────────────────────────────────────────
+  // Performs live DuckDuckGo search + page fetching to ground answers with
+  // real documentation (especially for platform-specific config tasks).
+  webResearch: async (step, ctx) => {
+    const start = Date.now();
+    const query      = String(step.params.query      || ctx.prompt);
+    const currentUrl = String(step.params.currentUrl || '');
+    const searchQ    = String(step.params.searchQuery || query);
+    const result = await performWebResearch(query, currentUrl, searchQ);
+    return {
+      stepId: step.id,
+      success: result.found,
+      data: { summary: result.summary, sources: result.sources },
+      durationMs: Date.now() - start,
+    };
+  },
+  // ─── PageIntelligence Agent ──────────────────────────────────────────────
+  // Parses a natural-language query into structured intent constraints and
+  // plans concrete DOM actions against a live browser snapshot.
+  pageIntelligence: async (step, ctx) => {
+    const start = Date.now();
+    const query = String(step.params.query || ctx.prompt);
+    if (step.action === 'parse_intent') {
+      const intent = await parseUserIntent(query);
+      return { stepId: step.id, success: true, data: intent, durationMs: Date.now() - start };
+    }
+    // Default: plan_actions — requires a browserSnapshot in params
+    const browserSnapshot = step.params.browserSnapshot as Parameters<typeof planPageActions>[1];
+    if (!browserSnapshot) {
+      return { stepId: step.id, success: false, error: 'browserSnapshot is required for pageIntelligence:plan_actions', durationMs: 0 };
+    }
+    const intent = await parseUserIntent(query);
+    const actions = await planPageActions(intent, browserSnapshot, query);
+    return { stepId: step.id, success: true, data: { intent, actions }, durationMs: Date.now() - start };
   },
   analyzer: async (step) => {
     // Analyzer is typically called through analyze_page action
@@ -236,41 +274,68 @@ export class ExecutionEngine {
       };
     }
     
-    // Execute with retry logic
+    // ── Circuit-breaker retry loop ─────────────────────────────────────────
+    // Errors are classified before every retry decision.
+    // TERMINAL / INTERRUPTABLE → break immediately (no retry)
+    // RECOVERABLE              → retry exactly once
+    // TRANSIENT                → retry up to retryCount times
     let lastError: Error | null = null;
+    let lastErrorClass: StepResult['errorClass'] = 'TRANSIENT';
     const maxAttempts = context.options.retryCount + 1;
-    
+
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
       try {
         registry.setStatus(step.agent, 'busy');
-        
+
         // Execute with timeout
         const result = await this.withTimeout(
           executor(step, context),
           context.options.timeout,
           `Step ${step.id} timed out after ${context.options.timeout}ms`,
         );
-        
+
         registry.recordSuccess(step.agent, result.durationMs);
         return result;
-        
+
       } catch (err) {
         lastError = err instanceof Error ? err : new Error(String(err));
-        
+
+        // ── Classify the error ──────────────────────────────────────────────
+        const classification = classifyError(lastError, step.agent, attempt);
+        lastErrorClass = classification.class;
+
+        const canRetry = shouldRetry(classification, { retryCount: context.options.retryCount });
+
+        console.warn(
+          `[ExecutionEngine] [${classification.class}] Step ${step.id} failed (attempt ${attempt}/${maxAttempts}): ${classification.reason}`,
+        );
+
+        if (!canRetry) {
+          // Circuit breaker: stop immediately for TERMINAL or INTERRUPTABLE
+          console.error(
+            `[ExecutionEngine] [${classification.class}] Step ${step.id} will NOT be retried — ${classification.reason}`,
+          );
+          break;
+        }
+
         if (attempt < maxAttempts) {
-          console.warn(`[ExecutionEngine] Step ${step.id} failed (attempt ${attempt}/${maxAttempts}), retrying...`);
           await this.delay(context.options.retryDelay);
         }
       }
     }
-    
-    // All retries failed
-    registry.recordFailure(step.agent, lastError?.message || 'Unknown error', Date.now() - startTime);
-    
+
+    // All retries exhausted or circuit breaker tripped
+    const errorMessage = lastError
+      ? formatErrorForLLM(classifyError(lastError, step.agent, maxAttempts), step.id)
+      : 'Unknown error';
+
+    registry.recordFailure(step.agent, errorMessage, Date.now() - startTime);
+
     return {
       stepId: step.id,
       success: false,
-      error: lastError?.message || 'Unknown error',
+      error: errorMessage,
+      errorClass: lastErrorClass,
       durationMs: Date.now() - startTime,
     };
   }

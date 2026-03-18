@@ -3,7 +3,7 @@
 // Agent action step in a plan
 export interface AgentStep {
     id: string;
-    agent: 'browser' | 'summarizer' | 'memory' | 'config' | 'analyzer' | 'vision';
+    agent: 'browser' | 'summarizer' | 'memory' | 'config' | 'analyzer' | 'vision' | 'webResearch' | 'pageIntelligence';
     action: string;
     params: Record<string, unknown>;
     dependsOn?: string;
@@ -23,6 +23,8 @@ export interface IntentRequest {
     context?: {
         url?: string;
         title?: string;
+        /** User region for location-aware URLs (e.g. IN → amazon.in, US → amazon.com) */
+        region?: string;
     };
     screenshot?: string; // base64 JPEG — for vision-informed planning
 }
@@ -49,6 +51,8 @@ export interface StepResult {
     success: boolean;
     data?: unknown;
     error?: string;
+    /** Classified error category from errorTaxonomy. Only set on failure. */
+    errorClass?: 'TRANSIENT' | 'RECOVERABLE' | 'INTERRUPTABLE' | 'TERMINAL';
     durationMs: number;
 }
 
