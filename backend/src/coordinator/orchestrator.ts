@@ -349,7 +349,6 @@ ${webGrounding}${sourceLine}`;
 
         while (state.iteration < this.config.maxReActIterations) {
             state.iteration++;
-            consecutiveFailures = 0;
 
             const history = state.thoughts.map((t, i) =>
                 `Iteration ${i + 1}:\nThought: ${t}\nAction: ${state.actions[i]}\nObservation: ${state.observations[i] ?? 'pending'}${failedQueries.size > 0 ? `\n(Failed queries so far: ${[...failedQueries].join(', ')})` : ''}`,
@@ -438,6 +437,7 @@ ${webGrounding}${sourceLine}`;
                 try {
                     const observation = await this.executeReActAction(step.action, step.actionParams, sessionId);
                     state.observations.push(observation);
+                    consecutiveFailures = 0;
 
                     // Track queries that returned no useful results
                     if (step.action === 'search_web' && observation.includes('returned no usable results')) {
@@ -519,6 +519,12 @@ ${webGrounding}${sourceLine}`;
                 } catch (err) {
                     return `Web research failed: ${(err as Error).message}`;
                 }
+            }
+            case 'analyze_page': {
+                const selector = String(params.selector ?? '');
+                return selector
+                    ? `Browser page analysis is not available in this backend-only environment (requested selector: ${selector}). Use search_web with a focused query instead.`
+                    : 'Browser page analysis is not available in this backend-only environment. Use search_web with a focused query instead.';
             }
             case 'read_file': {
                 throw new Error(

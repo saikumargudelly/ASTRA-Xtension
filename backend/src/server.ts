@@ -11,7 +11,9 @@ import { closeRedis } from './db/redis.js';
 import { closePostgres, migrateSchema } from './db/postgres.js';
 
 const PORT = Number(process.env.PORT) || 3001;
-const HOST = process.env.HOST || '0.0.0.0';
+// Bind explicitly to loopback by default to avoid Fastify/Node interface enumeration
+// issues on some macOS/Node builds (uv_interface_addresses).
+const HOST = process.env.HOST || '127.0.0.1';
 
 async function start() {
     const app = Fastify({

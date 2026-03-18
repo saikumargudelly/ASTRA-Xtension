@@ -57,6 +57,7 @@ export function Popup() {
     const [isConnected, setIsConnected] = useState(true);
     const [followUp, setFollowUp] = useState<FollowUpState | null>(null);
     const [followUpInput, setFollowUpInput] = useState('');
+    const [actionProgress, setActionProgress] = useState<Array<{ actionIndex: number; label: string; status: string; emoji?: string; result?: string }>>([]);
     const outputRef = useRef<HTMLDivElement>(null);
     const textareaRef = useRef<HTMLTextAreaElement>(null);
 
@@ -122,6 +123,17 @@ export function Popup() {
                 // NEXUS AI streaming tokens (relayed from background SW)
                 case 'NEXUS_TOKEN' as CommandResultMessage['type']:
                     setStreamedText((prev) => prev + (message as any).payload.text);
+                    break;
+
+                case 'ACTION_PROGRESS':
+                    const actionMsg = message as any;
+                    const actionProg = actionMsg.payload as { actionIndex: number; label: string; status: string; emoji?: string; result?: string; error?: string };
+                    setActionProgress((prev) => {
+                        const idx = prev.findIndex(a => a.actionIndex === actionProg.actionIndex);
+                        const updated = idx >= 0 ? [...prev] : [...prev];
+                        updated[idx >= 0 ? idx : prev.length] = actionProg;
+                        return updated;
+                    });
                     break;
 
                 case 'COMMAND_FOLLOW_UP':
@@ -240,6 +252,7 @@ export function Popup() {
         setPrompt('');
         setFollowUp(null);
         setFollowUpInput('');
+        setActionProgress([]);
         setViewMode('input');
         setTimeout(() => textareaRef.current?.focus(), 50);
     };
@@ -345,6 +358,33 @@ export function Popup() {
                                 <span className="text-[9px] text-astra-text-muted flex-shrink-0">
                                     {step.step}/{step.totalSteps}
                                 </span>
+                            </div>
+                        ))}
+                    </div>
+                )}
+
+                {/* Action-Level Progress: Show what ASTRA is doing step-by-step */}
+                {actionProgress.length > 0 && (
+                    <div className="space-y-1">
+                        <p className="text-[10px] font-semibold text-astra-text-muted uppercase tracking-wider">
+                            📍 Actions Executed
+                        </p>
+                        {actionProgress.map((action, i) => (
+                            <div key={i} className="flex items-start gap-2 text-xs animate-slide-up">
+                                <span className="flex-shrink-0 mt-0.5">
+                                    {action.status === 'success' ? '✅' :
+                                        action.status === 'failed' ? '❌' :
+                                            action.status === 'executing' ? '▶️' : '○'}
+                                </span>
+                                <div className="flex-1 min-w-0">
+                                    <span className="text-astra-text">{action.emoji ?? ''} {action.label}</span>
+                                    {action.result && (
+                                        <div className="text-[9px] text-green-400/80 mt-0.5">→ {action.result}</div>
+                                    )}
+                                    {action.error && (
+                                        <div className="text-[9px] text-red-400/80 mt-0.5">✗ {action.error}</div>
+                                    )}
+                                </div>
                             </div>
                         ))}
                     </div>

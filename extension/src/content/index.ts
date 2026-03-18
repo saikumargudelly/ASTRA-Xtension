@@ -383,6 +383,9 @@ function showFollowUpOverlay(
 ): void {
     // Remove any existing overlay
     hideFollowUpOverlay();
+    
+    // DEBUG LOG
+    console.log(`[DEBUG|Content] showFollowUpOverlay called:`, { question, options, category });
 
     // Create shadow host for style isolation
     const host = document.createElement('div');
@@ -816,7 +819,7 @@ function getPageSnapshot(): {
         url: location.href,
         title: document.title,
         visibleText,
-        interactiveElements: elements.slice(0, 200), // Increased cap for richer snapshots
+        interactiveElements: elements.slice(0, 400), // High cap so backend prioritizer can sort them
     };
 }
 
@@ -1308,51 +1311,80 @@ function clearAstraBadges() {
 // ─── Smart Element Finder ───
 // Scores DOM elements against a description to find the best match.
 // Used by the vision pipeline to translate "what vision sees" into real DOM selectors.
-function findElementByDescription(description: string, elementType?: string): string | null {
+function findElementByDescription(description: string, elementType?: string, strategy?: string): string | null {
     const desc = (description || '').toLowerCase();
     const type = (elementType || '').toLowerCase();
 
-    // Candidate selectors to try based on element type hint
+    // Priority 1: Try specific search selectors if search-related
+    if (desc.includes('search') || desc.includes('query') || desc.includes('find') || type === 'search-input') {
+        const searchSelectors = [
+            'input[role="searchbox"]',
+            'input[placeholder*="search" i]',
+            'input[aria-label*="search" i]',
+            '[role="search"] input',
+            'input[type="search"]',
+            'input[name*="q" i]',
+            'input[name*="search" i]',
+            // Spotify/generic search patterns
+            'input[data-testid="search-input"]',
+            'input.search-input',
+            'input[placeholder*="What do you want"]', // Spotify specific
+        ];
+
+        for (const selector of searchSelectors) {
+            try {
+                const result = document.querySelector(selector) as HTMLElement | null;
+                if (result && isVisible(result)) {
+                    // Explicit check: reject if it's a layout/resizer control
+                    const className = result.className.toString().toLowerCase();
+                    if (className.includes('resizer') || className.includes('layout') || className.includes('splitter')) {
+                        continue;
+                    }
+                    return generateSmartSelector(result);
+                }
+            } catch {
+                continue;
+            }
+        }
+        
+        // Fallback: Find any visible input that's NOT a layout control
+        const allInputs = document.querySelectorAll('input:not([type="hidden"])');
+        for (const input of Array.from(allInputs)) {
+            if (!isVisible(input as HTMLElement)) continue;
+            const className = input.className.toString().toLowerCase();
+            // Skip layout controls explicitly
+            if (className.includes('resizer') || className.includes('layout') || className.includes('splitter') ||
+                className.includes('divider') || className.includes('handle')) {
+                continue;
+            }
+            // Prefer inputs with common search indicators
+            const text = getElementText(input).toLowerCase();
+            const attrs = [input.getAttribute('aria-label') || '', input.getAttribute('placeholder') || ''];
+            if (attrs.some(a => a.toLowerCase().includes('search') || a.toLowerCase().includes('play') || a.toLowerCase().includes('what'))) {
+                return generateSmartSelector(input);
+            }
+        }
+    }
+
+    // Priority 2: Regular candidate selection
     let candidates: NodeListOf<Element> | Element[];
-    if (type === 'search-input' || desc.includes('search')) {
-        candidates = document.querySelectorAll(
-            'input[type="search"], input[name="q"], input[placeholder*="search" i], [role="search"] input, input[aria-label*="search" i]'
-        );
-    } else if (type === 'button' || desc.includes('button') || desc.includes('submit')) {
+    if (type === 'button' || desc.includes('button') || desc.includes('submit')) {
         candidates = document.querySelectorAll('button, [role="button"], input[type="submit"]');
     } else if (type === 'form' || desc.includes('form')) {
         candidates = document.querySelectorAll('form');
     } else {
-        candidates = document.querySelectorAll('input, button, [role="button"], [role="search"], a, select, textarea');
+        candidates = document.querySelectorAll('input, button, [role="button"], [role="search"], a, select, textarea, [contenteditable]');
     }
 
     let bestScore = 0;
     let bestEl: Element | null = null;
+    const scores: Array<[Element, number]> = [];
 
     for (const el of Array.from(candidates)) {
         if (!isVisible(el as HTMLElement)) continue;
 
-        let score = 0;
-        const elText = [
-            el.getAttribute('placeholder'),
-            el.getAttribute('aria-label'),
-            el.getAttribute('name'),
-            el.getAttribute('id'),
-            el.getAttribute('class'),
-            el.getAttribute('title'),
-            el.textContent,
-        ].filter(Boolean).join(' ').toLowerCase();
-
-        // Score by keyword matches
-        for (const word of desc.split(/\s+/)) {
-            if (word.length > 2 && elText.includes(word)) score += 10;
-        }
-        // Bonus for exact type match
-        if (el.tagName === 'INPUT' && (desc.includes('input') || desc.includes('search'))) score += 5;
-        if (el.tagName === 'BUTTON' && desc.includes('button')) score += 5;
-        // Bonus for visible / prominent position
-        const rect = el.getBoundingClientRect();
-        if (rect.top < window.innerHeight / 3) score += 3; // Near top of page
+        let score = scoreElementForDescription(el, desc, type);
+        scores.push([el, score]);
 
         if (score > bestScore) {
             bestScore = score;
@@ -1360,16 +1392,166 @@ function findElementByDescription(description: string, elementType?: string): st
         }
     }
 
-    if (!bestEl || bestScore === 0) return null;
+    // Safety check: if top element has "resize" or layout keywords and score is low-medium, try second-best
+    if (bestEl && bestScore < 60) {
+        const elText = getElementText(bestEl).toLowerCase();
+        if (elText.includes('resize') || elText.includes('layout') || elText.includes('splitter')) {
+            // Try second best
+            scores.sort((a, b) => b[1] - a[1]);
+            if (scores.length > 1 && scores[1][1] > 30) {
+                bestEl = scores[1][0];
+                bestScore = scores[1][1];
+            }
+        }
+    }
 
-    // Build a reliable selector for the found element
-    if (bestEl.id) return `#${CSS.escape(bestEl.id)}`;
-    if (bestEl.getAttribute('name')) return `[name="${bestEl.getAttribute('name')}"]`;
-    if (bestEl.getAttribute('aria-label')) return `[aria-label="${bestEl.getAttribute('aria-label')}"]`;
-    if (bestEl.getAttribute('placeholder')) return `[placeholder="${bestEl.getAttribute('placeholder')}"]`;
-    // Fallback: tag + class
-    const cls = Array.from(bestEl.classList).slice(0, 2).join('.');
-    return cls ? `${bestEl.tagName.toLowerCase()}.${cls}` : bestEl.tagName.toLowerCase();
+    if (!bestEl || bestScore < 20) return null;
+
+    return generateSmartSelector(bestEl);
+}
+
+/**
+ * Enhanced scoring for element matching.
+ */
+function scoreElementForDescription(element: Element, desc: string, type: string): number {
+    let score = 0;
+    const elText = getElementText(element).toLowerCase();
+    const className = (element.className?.toString() || '').toLowerCase();
+
+    // CRITICAL: Red flag detection - absolutely penalize layout/UI controls
+    // These should NEVER be selected for user actions
+    const criticalFlags = ['resizer', 'splitter', 'divider', 'handle', 'resize', 'layout-control'];
+    const softFlags = ['layout', 'nav-bar', 'sidebar-toggle'];
+    
+    for (const flag of criticalFlags) {
+        if (elText.includes(flag) || className.includes(flag)) {
+            score = Math.max(-1000, score - 200); // MASSIVE penalty - essentially exclude
+        }
+    }
+    
+    for (const flag of softFlags) {
+        if (elText.includes(flag) || className.includes(flag)) {
+            score -= 80;
+        }
+    }
+
+    // If still has critical flags in text/class after penalties, exclude completely
+    if (elText.includes('resizer') || className.includes('resizer')) {
+        return -1000;
+    }
+
+    // Keyword matching
+    const keywords = desc.split(/\s+/).filter(w => w.length > 2);
+    let matchingKeywords = 0;
+    for (const word of keywords) {
+        if (elText.includes(word)) {
+            score += 15;
+            matchingKeywords++;
+        }
+    }
+
+    // Penalty if no keywords matched
+    if (matchingKeywords === 0 && keywords.length > 0) {
+        score -= 30;
+    }
+
+    // Type-specific scoring
+    if (desc.includes('search') || type === 'search-input') {
+        // Strong bonus for search-specific attributes
+        if (element.hasAttribute('role') && element.getAttribute('role')!.includes('search')) score += 25;
+        if (element.hasAttribute('aria-label') && element.getAttribute('aria-label')!.toLowerCase().includes('search')) score += 25;
+        if (element instanceof HTMLInputElement && element.type === 'search') score += 20;
+
+        // Penalize non-input elements
+        if (element.tagName !== 'INPUT' && element.tagName !== 'TEXTAREA') score -= 20;
+
+        // Penalize layout inputs - DOUBLE penalty for search context
+        if (elText.includes('resize') || elText.includes('layout') || className.includes('resizer')) {
+            score -= 200; // Massive penalty
+        }
+    }
+
+    // Position bonus - elements near top are usually more important
+    const rect = element.getBoundingClientRect();
+    if (rect.top >= 0 && rect.top < window.innerHeight / 2) {
+        score += 5;
+    }
+
+    // Visibility check
+    if (rect.width > 30 && rect.height > 20) {
+        score += 5; // Element has reasonable size
+    }
+
+    return Math.max(-1000, score); // Allow negative scores to exclude elements
+}
+
+/**
+ * Get all text content from an element for analysis.
+ */
+function getElementText(element: Element): string {
+    return [
+        element.getAttribute('placeholder') || '',
+        element.getAttribute('aria-label') || '',
+        element.getAttribute('name') || '',
+        element.getAttribute('id') || '',
+        element.getAttribute('class') || '',
+        element.getAttribute('title') || '',
+        element.getAttribute('data-testid') || '',
+        element.getAttribute('role') || '',
+        (element.textContent || '').slice(0, 100),
+    ]
+        .filter(Boolean)
+        .join(' ');
+}
+
+/**
+ * Generate smart CSS selector with multiple fallback strategies.
+ */
+function generateSmartSelector(element: Element): string {
+    // Priority 1: data-testid (most reliable for modern apps)
+    if (element.hasAttribute('data-testid')) {
+        return `[data-testid="${CSS.escape(element.getAttribute('data-testid')!)}"]`;
+    }
+
+    // Priority 2: aria-label (accessibility)
+    if (element.hasAttribute('aria-label')) {
+        const label = element.getAttribute('aria-label')!;
+        const similar = document.querySelectorAll(`[aria-label="${label}"]`);
+        if (similar.length === 1) {
+            return `[aria-label="${CSS.escape(label)}"]`;
+        }
+    }
+
+    // Priority 3: ID (unique)
+    if (element.id) {
+        return `#${CSS.escape(element.id)}`;
+    }
+
+    // Priority 4: Name (form-specific)
+    if (element.hasAttribute('name')) {
+        const name = element.getAttribute('name')!;
+        const similar = document.querySelectorAll(`[name="${name}"]`);
+        if (similar.length === 1) {
+            return `[name="${CSS.escape(name)}"]`;
+        }
+    }
+
+    // Priority 5: Type + placeholder (for inputs)
+    if (element instanceof HTMLInputElement && element.placeholder) {
+        return `input[placeholder="${CSS.escape(element.placeholder)}"]`;
+    }
+
+    // Priority 6: Type + class (complex selector)
+    const classes = Array.from(element.classList)
+        .filter(c => c.length > 2 && !c.match(/^(ql-|fr-|fade)/)) // Filter out utility/animation classes
+        .slice(0, 3);
+
+    if (classes.length > 0) {
+        return `${element.tagName.toLowerCase()}.${classes.join('.')}`;
+    }
+
+    // Fallback: Just tag name
+    return element.tagName.toLowerCase();
 }
 
 // ─── Utilities ───
@@ -1724,16 +1906,41 @@ if (document.body) {
     });
 }
 
-function isVisible(el: HTMLElement): boolean {
-    // Allow hidden inputs/labels to be clicked by ASTRA if they are in sidebars
-    const isFilterPart = el.tagName === 'INPUT' || el.tagName === 'LABEL';
-    if (isFilterPart) return true;
-
-    if (!el.offsetParent && el.tagName !== 'BODY') return false;
+function isRenderableBox(el: HTMLElement): boolean {
     const style = window.getComputedStyle(el);
-    if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return false;
+    if (style.display === 'none' || style.visibility === 'hidden') return false;
+    if (Number(style.opacity) === 0) return false;
     const rect = el.getBoundingClientRect();
     return rect.width > 0 && rect.height > 0;
+}
+
+function isVisible(el: HTMLElement): boolean {
+    if (!isRenderableBox(el)) return false;
+
+    // Most elements need to participate in layout flow.
+    if (el.offsetParent || el.tagName === 'BODY') return true;
+
+    // Inputs can still be usable when visually represented by a label.
+    if (el.tagName === 'INPUT') {
+        const input = el as HTMLInputElement;
+
+        if ((input.type === 'checkbox' || input.type === 'radio') && input.id) {
+            try {
+                const linkedLabel = document.querySelector(`label[for="${CSS.escape(input.id)}"]`) as HTMLElement | null;
+                if (linkedLabel && isRenderableBox(linkedLabel)) return true;
+            } catch {
+                // Ignore malformed selectors from unusual IDs.
+            }
+        }
+
+        const wrappingLabel = input.closest('label') as HTMLElement | null;
+        if (wrappingLabel && isRenderableBox(wrappingLabel)) return true;
+    }
+
+    // Labels are actionable only when they are actually rendered.
+    if (el.tagName === 'LABEL') return isRenderableBox(el);
+
+    return false;
 }
 
 // ═══════════════════════════════════════════════
@@ -2233,7 +2440,45 @@ function findSearchInputDeep(root: Document | ShadowRoot | HTMLElement = documen
 // ─── DOM Action Executor ───
 // ═══════════════════════════════════════════════
 async function handleDOMAction(message: ExecuteDOMActionMessage) {
-    const { action, selector, value, duration, direction, amount } = message.payload;
+    const {
+        action,
+        selector,
+        value,
+        duration,
+        direction,
+        amount,
+        targetSelector,
+        checked,
+        files,
+        response,
+        expectedText,
+        iframeSelector,
+        innerAction,
+        percent,
+    } = message.payload;
+
+    const findElement = (sel: string): HTMLElement | null => safeQuerySelector(sel) as HTMLElement | null;
+    const ensureElement = (sel: string): HTMLElement => {
+        const el = findElement(sel);
+        if (!el) throw new Error(`Element not found: ${sel}`);
+        return el;
+    };
+
+    const setInputValue = (el: HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement, newValue: string) => {
+        if (el instanceof HTMLSelectElement) {
+            el.value = newValue;
+        } else if (el instanceof HTMLTextAreaElement) {
+            const setter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value')?.set;
+            if (setter) setter.call(el, newValue);
+            else el.value = newValue;
+        } else {
+            const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')?.set;
+            if (setter) setter.call(el, newValue);
+            else el.value = newValue;
+        }
+        el.dispatchEvent(new Event('input', { bubbles: true, composed: true }));
+        el.dispatchEvent(new Event('change', { bubbles: true, composed: true }));
+    };
 
     switch (action) {
         case 'click': {
@@ -2273,34 +2518,150 @@ async function handleDOMAction(message: ExecuteDOMActionMessage) {
             return { success: true, data: { clicked: selector } };
         }
 
+        case 'double_click': {
+            if (!selector) throw new Error('double_click requires a selector');
+            const el = ensureElement(selector);
+            el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+            await sleep(120);
+
+            const rect = el.getBoundingClientRect();
+            const clientX = rect.left + rect.width / 2;
+            const clientY = rect.top + rect.height / 2;
+            const eventOpts = { bubbles: true, cancelable: true, clientX, clientY };
+
+            el.dispatchEvent(new PointerEvent('pointerdown', eventOpts));
+            el.dispatchEvent(new MouseEvent('mousedown', eventOpts));
+            el.dispatchEvent(new PointerEvent('pointerup', eventOpts));
+            el.dispatchEvent(new MouseEvent('mouseup', eventOpts));
+            el.dispatchEvent(new MouseEvent('click', eventOpts));
+            el.dispatchEvent(new PointerEvent('pointerdown', eventOpts));
+            el.dispatchEvent(new MouseEvent('mousedown', eventOpts));
+            el.dispatchEvent(new PointerEvent('pointerup', eventOpts));
+            el.dispatchEvent(new MouseEvent('mouseup', eventOpts));
+            el.dispatchEvent(new MouseEvent('dblclick', eventOpts));
+
+            return { success: true, data: { doubleClicked: selector } };
+        }
+
+        case 'right_click': {
+            if (!selector) throw new Error('right_click requires a selector');
+            const el = ensureElement(selector);
+            el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+            await sleep(120);
+
+            const rect = el.getBoundingClientRect();
+            const clientX = rect.left + rect.width / 2;
+            const clientY = rect.top + rect.height / 2;
+            const eventOpts = { bubbles: true, cancelable: true, button: 2, buttons: 2, clientX, clientY };
+
+            el.dispatchEvent(new PointerEvent('pointerdown', eventOpts));
+            el.dispatchEvent(new MouseEvent('mousedown', eventOpts));
+            el.dispatchEvent(new PointerEvent('pointerup', eventOpts));
+            el.dispatchEvent(new MouseEvent('mouseup', eventOpts));
+            el.dispatchEvent(new MouseEvent('contextmenu', eventOpts));
+
+            return { success: true, data: { rightClicked: selector } };
+        }
+
+        case 'hover': {
+            if (!selector) throw new Error('hover requires a selector');
+            const el = ensureElement(selector);
+            el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+            await sleep(100);
+
+            const rect = el.getBoundingClientRect();
+            const opts = {
+                bubbles: true,
+                cancelable: true,
+                clientX: rect.left + rect.width / 2,
+                clientY: rect.top + rect.height / 2,
+            };
+            el.dispatchEvent(new PointerEvent('pointerover', opts));
+            el.dispatchEvent(new PointerEvent('pointerenter', opts));
+            el.dispatchEvent(new MouseEvent('mouseover', opts));
+            el.dispatchEvent(new MouseEvent('mouseenter', opts));
+            return { success: true, data: { hovered: selector } };
+        }
+
+        case 'highlight': {
+            if (!selector) throw new Error('highlight requires a selector');
+            const el = ensureElement(selector);
+            const oldOutline = el.style.outline;
+            const oldBoxShadow = el.style.boxShadow;
+            const ms = Math.max(100, Math.min(10_000, duration ?? 1500));
+
+            el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+            el.style.outline = '3px solid #0ea5e9';
+            el.style.boxShadow = '0 0 0 6px rgba(14, 165, 233, 0.25)';
+            await sleep(ms);
+            el.style.outline = oldOutline;
+            el.style.boxShadow = oldBoxShadow;
+
+            return { success: true, data: { highlighted: selector, duration: ms } };
+        }
+
+        case 'drag_and_drop':
+        case 'drag_drop': {
+            if (!selector) throw new Error(`${action} requires a source selector`);
+            const target = targetSelector;
+            if (!target) throw new Error(`${action} requires targetSelector`);
+
+            const sourceEl = ensureElement(selector);
+            const targetEl = ensureElement(target);
+
+            sourceEl.scrollIntoView({ behavior: 'smooth', block: 'center' });
+            await sleep(100);
+            targetEl.scrollIntoView({ behavior: 'smooth', block: 'center' });
+            await sleep(100);
+
+            const dataTransfer = typeof DataTransfer !== 'undefined' ? new DataTransfer() : undefined;
+            const dragOpts = { bubbles: true, cancelable: true, dataTransfer } as DragEventInit;
+
+            sourceEl.dispatchEvent(new DragEvent('dragstart', dragOpts));
+            sourceEl.dispatchEvent(new DragEvent('drag', dragOpts));
+            targetEl.dispatchEvent(new DragEvent('dragenter', dragOpts));
+            targetEl.dispatchEvent(new DragEvent('dragover', dragOpts));
+            targetEl.dispatchEvent(new DragEvent('drop', dragOpts));
+            sourceEl.dispatchEvent(new DragEvent('dragend', dragOpts));
+
+            return {
+                success: true,
+                data: { dragged: selector, droppedOn: target },
+            };
+        }
+
         case 'type': {
             if (!selector) throw new Error('type requires a selector');
             if (value === undefined || value === null) throw new Error('type requires a value');
+            const textValue = String(value);
             const el = safeQuerySelector(selector) as HTMLInputElement | HTMLTextAreaElement | null;
             if (!el) throw new Error(`Element not found: ${selector}`);
             
             // ─── Visual cursor feedback ───
-            await cursorFocusElement(el, `Typing "${value.substring(0, 20)}${value.length > 20 ? '...' : ''}"`);
+            await cursorFocusElement(el, `Typing "${textValue.substring(0, 20)}${textValue.length > 20 ? '...' : ''}"`);
             
             el.focus();
             
             // Clear existing value robustly (React-friendly)
             const nativeInputValueSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')?.set;
             const nativeTextAreaValueSetter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value')?.set;
-            const setter = el instanceof HTMLTextAreaElement ? nativeTextAreaValueSetter : nativeInputValueSetter;
+            const setter = el instanceof HTMLTextAreaElement ? nativeTextAreaValueSetter : 
+                           (el instanceof HTMLInputElement ? nativeInputValueSetter : undefined);
             
             if (setter) {
                 setter.call(el, '');
+            } else if ('value' in el) {
+                (el as any).value = '';
             } else {
-                el.value = '';
+                return { success: false, error: `Cannot type into ${(el as Element).tagName}: not a valid input element. You must find the actual text-input element.` };
             }
             el.dispatchEvent(new Event('input', { bubbles: true, composed: true }));
             el.dispatchEvent(new Event('change', { bubbles: true, composed: true }));
             
             // Type the new value character by character with full KeyboardEvent lifecycle
             let currentVal = '';
-            const isSubmit = value.endsWith('\n') || value.endsWith('\\n');
-            const typeValue = isSubmit ? value.replace(/\\?n$/, '') : value;
+            const isSubmit = textValue.endsWith('\n') || textValue.endsWith('\\n') || textValue.endsWith('\\\\n');
+            const typeValue = textValue.replace(/\\{1,2}n$/, '').replace(/\n$/, '');
             
             for (const char of typeValue) {
                 currentVal += char;
@@ -2313,15 +2674,15 @@ async function handleDOMAction(message: ExecuteDOMActionMessage) {
                 // Set value
                 if (setter) {
                     setter.call(el, currentVal);
-                } else {
-                    el.value = currentVal;
+                } else if ('value' in el) {
+                    (el as any).value = currentVal;
                 }
                 
                 // Input & Keyup
                 el.dispatchEvent(new Event('input', { bubbles: true, composed: true }));
                 el.dispatchEvent(new KeyboardEvent('keyup', keyOpts));
                 
-                await sleep(15);
+                await sleep(30); // Slower typing for visibility (30ms per char)
             }
             
             el.dispatchEvent(new Event('change', { bubbles: true, composed: true }));
@@ -2343,21 +2704,209 @@ async function handleDOMAction(message: ExecuteDOMActionMessage) {
             return { success: true, data: { typed: typeValue, into: selector } };
         }
 
+        case 'set_value': {
+            if (!selector) throw new Error('set_value requires a selector');
+            if (value === undefined || value === null) throw new Error('set_value requires a value');
+            const rawValue = String(value);
+            const el = safeQuerySelector(selector) as HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement | null;
+            if (!el) throw new Error(`Element not found: ${selector}`);
+            setInputValue(el, rawValue);
+            return { success: true, data: { set: rawValue, into: selector } };
+        }
+
+        case 'focus': {
+            if (!selector) throw new Error('focus requires a selector');
+            const el = ensureElement(selector);
+            el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+            await sleep(80);
+            el.focus();
+            return { success: true, data: { focused: selector } };
+        }
+
+        case 'clear': {
+            if (!selector) throw new Error('clear requires a selector');
+            const el = safeQuerySelector(selector) as HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement | null;
+            if (!el) throw new Error(`Element not found: ${selector}`);
+            setInputValue(el, '');
+            return { success: true, data: { cleared: selector } };
+        }
+
+        case 'select_option':
+        case 'select-option': {
+            if (!selector) throw new Error(`${action} requires a selector`);
+            if (value === undefined || value === null) throw new Error(`${action} requires a value`);
+            const desired = String(value).trim();
+
+            let selectEl = safeQuerySelector(selector) as HTMLSelectElement | null;
+            if (!(selectEl instanceof HTMLSelectElement)) {
+                const container = safeQuerySelector(selector) as HTMLElement | null;
+                if (container) {
+                    const nested = container.querySelector('select');
+                    if (nested instanceof HTMLSelectElement) selectEl = nested;
+                }
+            }
+            if (!(selectEl instanceof HTMLSelectElement)) {
+                throw new Error(`Element is not a <select>: ${selector}`);
+            }
+
+            const byValue = Array.from(selectEl.options).find((o) => o.value === desired);
+            const byText = Array.from(selectEl.options).find((o) => (o.textContent ?? '').trim().toLowerCase() === desired.toLowerCase());
+            const byIndex = /^\d+$/.test(desired) ? selectEl.options[Number.parseInt(desired, 10)] : undefined;
+            const option = byValue ?? byText ?? byIndex;
+
+            if (!option) throw new Error(`Option not found for value/text: ${desired}`);
+
+            selectEl.value = option.value;
+            selectEl.dispatchEvent(new Event('input', { bubbles: true, composed: true }));
+            selectEl.dispatchEvent(new Event('change', { bubbles: true, composed: true }));
+            return { success: true, data: { selected: option.value, selector } };
+        }
+
+        case 'range-set':
+        case 'range_set': {
+            if (!selector) throw new Error(`${action} requires a selector`);
+            if (value === undefined || value === null) throw new Error(`${action} requires a value`);
+            const input = safeQuerySelector(selector) as HTMLInputElement | null;
+            if (!(input instanceof HTMLInputElement)) throw new Error(`Element not found: ${selector}`);
+
+            const parsed = Number(value);
+            if (!Number.isFinite(parsed)) throw new Error(`${action} value must be a number`);
+
+            const min = input.min ? Number(input.min) : undefined;
+            const max = input.max ? Number(input.max) : undefined;
+            let clamped = parsed;
+            if (Number.isFinite(min)) clamped = Math.max(clamped, min as number);
+            if (Number.isFinite(max)) clamped = Math.min(clamped, max as number);
+
+            setInputValue(input, String(clamped));
+            return { success: true, data: { selector, value: clamped } };
+        }
+
+        case 'toggle_checkbox': {
+            if (!selector) throw new Error('toggle_checkbox requires a selector');
+            const el = ensureElement(selector);
+            if (el instanceof HTMLInputElement && (el.type === 'checkbox' || el.type === 'radio')) {
+                const targetState = typeof checked === 'boolean' ? checked : !el.checked;
+                if (el.checked !== targetState) {
+                    el.click();
+                }
+                el.dispatchEvent(new Event('change', { bubbles: true, composed: true }));
+                return { success: true, data: { selector, checked: el.checked } };
+            }
+
+            el.click();
+            return { success: true, data: { selector, toggled: true } };
+        }
+
+        case 'upload_file': {
+            if (!selector) throw new Error('upload_file requires a selector');
+            if (!Array.isArray(files) || files.length === 0) {
+                throw new Error('upload_file requires a non-empty files array');
+            }
+            return {
+                success: false,
+                error: 'upload_file is not supported from content script because browser security blocks direct local file path injection.',
+                data: { selector, filesCount: files.length },
+            };
+        }
+
+        case 'submit_form': {
+            let targetEl: HTMLElement | null = null;
+            if (selector) targetEl = findElement(selector);
+            if (!targetEl) targetEl = document.activeElement as HTMLElement | null;
+
+            if (targetEl instanceof HTMLFormElement) {
+                try { targetEl.requestSubmit(); } catch { targetEl.submit(); }
+                return { success: true, data: { submitted: selector ?? 'active_form' } };
+            }
+
+            const containingForm = targetEl?.closest('form') as HTMLFormElement | null;
+            if (containingForm) {
+                try { containingForm.requestSubmit(); } catch { containingForm.submit(); }
+                return { success: true, data: { submitted: selector ?? 'closest_form' } };
+            }
+
+            const submitBtn = (targetEl ?? document.body).querySelector('button[type="submit"], input[type="submit"]') as HTMLElement | null;
+            if (submitBtn) {
+                submitBtn.click();
+                return { success: true, data: { submitted: 'submit_button' } };
+            }
+
+            throw new Error('submit_form: no form or submit control found');
+        }
+
+        case 'copy_text': {
+            if (!selector) throw new Error('copy_text requires a selector');
+            const el = ensureElement(selector);
+            const text = (el.innerText || el.textContent || '').trim();
+            if (!text) throw new Error('copy_text: element has no text content');
+
+            try {
+                await navigator.clipboard.writeText(text);
+            } catch {
+                const ta = document.createElement('textarea');
+                ta.value = text;
+                ta.style.position = 'fixed';
+                ta.style.left = '-9999px';
+                document.body.appendChild(ta);
+                ta.focus();
+                ta.select();
+                document.execCommand('copy');
+                ta.remove();
+            }
+
+            return { success: true, data: { copied: text.slice(0, 250), length: text.length } };
+        }
+
         case 'scroll': {
             const scrollAmount = amount ?? 500;
-            const dir = direction === 'up' ? -1 : 1;
+            const dir = direction ?? 'down';
+            const deltaY = dir === 'up' ? -scrollAmount : dir === 'down' ? scrollAmount : 0;
+            const deltaX = dir === 'left' ? -scrollAmount : dir === 'right' ? scrollAmount : 0;
             if (selector) {
                 const el = safeQuerySelector(selector);
                 if (!el) throw new Error(`Element not found: ${selector}`);
-                el.scrollBy({ top: scrollAmount * dir, behavior: 'smooth' });
+                (el as HTMLElement).scrollBy({ top: deltaY, left: deltaX, behavior: 'smooth' });
             } else {
-                window.scrollBy({ top: scrollAmount * dir, behavior: 'smooth' });
+                window.scrollBy({ top: deltaY, left: deltaX, behavior: 'smooth' });
             }
-            return { success: true, data: { scrolled: scrollAmount * dir } };
+            return { success: true, data: { scrolledX: deltaX, scrolledY: deltaY } };
         }
 
+        case 'scroll_to': {
+            if (!selector) throw new Error('scroll_to requires a selector');
+            const el = ensureElement(selector);
+            el.scrollIntoView({ behavior: 'smooth', block: 'center', inline: 'center' });
+            return { success: true, data: { scrolledTo: selector } };
+        }
+
+        case 'scroll_to_percent': {
+            const raw = percent ?? (typeof value === 'number' ? value : Number.parseFloat(String(value ?? '0')));
+            if (!Number.isFinite(raw)) throw new Error('scroll_to_percent requires a numeric percent');
+            const pct = Math.max(0, Math.min(100, Number(raw)));
+
+            if (selector) {
+                const container = ensureElement(selector);
+                const maxScroll = Math.max(0, container.scrollHeight - container.clientHeight);
+                const targetY = Math.round((pct / 100) * maxScroll);
+                container.scrollTo({ top: targetY, behavior: 'smooth' });
+                return { success: true, data: { selector, percent: pct, targetY } };
+            }
+
+            const doc = document.documentElement;
+            const maxPageScroll = Math.max(0, doc.scrollHeight - window.innerHeight);
+            const targetY = Math.round((pct / 100) * maxPageScroll);
+            window.scrollTo({ top: targetY, behavior: 'smooth' });
+            return { success: true, data: { percent: pct, targetY } };
+        }
+
+
         case 'wait': {
-            const ms = duration ?? 1000;
+            const parsed = duration
+                ?? (typeof value === 'number'
+                    ? value
+                    : Number.parseInt(typeof value === 'string' ? value : '1000', 10));
+            const ms = Math.max(100, Math.min(15_000, Number.isFinite(parsed) ? parsed : 1000));
             await sleep(ms);
             return { success: true, data: { waited: ms } };
         }
@@ -2402,8 +2951,63 @@ async function handleDOMAction(message: ExecuteDOMActionMessage) {
             return { success: true, data: { pressedEnter: selector || 'active element' } };
         }
 
+        case 'dismiss_dialog': {
+            const mode = String(response ?? value ?? 'dismiss').toLowerCase();
+            const openDialog = document.querySelector('dialog[open]') as HTMLDialogElement | null;
+
+            if (openDialog) {
+                const acceptSelectors = [
+                    'button[value="ok"]',
+                    'button[value="yes"]',
+                    'button[type="submit"]',
+                    '.confirm',
+                    '.accept',
+                    '[data-action*="accept" i]',
+                    '[data-action*="confirm" i]',
+                ];
+                const dismissSelectors = [
+                    'button[value="cancel"]',
+                    '.cancel',
+                    '.close',
+                    '[data-action*="dismiss" i]',
+                    '[data-action*="cancel" i]',
+                    '[aria-label*="close" i]',
+                ];
+                const selectorsToTry = mode === 'accept' ? acceptSelectors : dismissSelectors;
+                for (const sel of selectorsToTry) {
+                    const btn = openDialog.querySelector(sel) as HTMLElement | null;
+                    if (btn && isVisible(btn)) {
+                        btn.click();
+                        return { success: true, data: { mode, via: sel } };
+                    }
+                }
+
+                if (mode !== 'accept') {
+                    try { openDialog.close(); } catch { /* noop */ }
+                }
+            }
+
+            const target = (document.activeElement as HTMLElement | null) ?? document.body;
+            const key = mode === 'accept' ? 'Enter' : 'Escape';
+            const code = mode === 'accept' ? 'Enter' : 'Escape';
+            const keyOpts: KeyboardEventInit = {
+                key,
+                code,
+                bubbles: true,
+                cancelable: true,
+                composed: true,
+            };
+            target.dispatchEvent(new KeyboardEvent('keydown', keyOpts));
+            target.dispatchEvent(new KeyboardEvent('keyup', keyOpts));
+
+            return { success: true, data: { mode, via: 'keyboard' } };
+        }
+
         case 'search': {
-            if (!value) throw new Error('search requires a value');
+            if (value === undefined || value === null || String(value).trim() === '') {
+                throw new Error('search requires a value');
+            }
+            const searchValue = String(value);
 
             // Try Deep Search first
             let el = findSearchInputDeep();
@@ -2461,7 +3065,7 @@ async function handleDOMAction(message: ExecuteDOMActionMessage) {
             // ─── Visual cursor feedback ───
             el.scrollIntoView({ behavior: 'smooth', block: 'center' });
             await sleep(200);
-            await cursorFocusElement(el as HTMLElement, `Searching for "${value.substring(0, 30)}${value.length > 30 ? '...' : ''}"`);
+            await cursorFocusElement(el as HTMLElement, `Searching for "${searchValue.substring(0, 30)}${searchValue.length > 30 ? '...' : ''}"`);
 
             el.focus();
             el.click(); // Ensure it's active
@@ -2484,16 +3088,16 @@ async function handleDOMAction(message: ExecuteDOMActionMessage) {
                 element.dispatchEvent(new Event('input', { bubbles: true }));
             };
 
-            // 1. Visually simulate typing (for user benefit) - FAST
+            // 1. Visually simulate typing (for user benefit) - SLOWER for visibility
             let currentVal = '';
-            for (const char of value) {
+            for (const char of searchValue) {
                 currentVal += char;
                 setNativeValue(el, currentVal);
-                await sleep(5 + Math.random() * 5);
+                await sleep(30 + Math.random() * 20); // Slower: 30-50ms per char for visibility
             }
 
             // 2. Force set final value
-            setNativeValue(el, value);
+            setNativeValue(el, searchValue);
             el.dispatchEvent(new Event('change', { bubbles: true }));
 
             // 3. Submit (Hardened)
@@ -2567,7 +3171,102 @@ async function handleDOMAction(message: ExecuteDOMActionMessage) {
                 setTimeout(() => { el.style.outline = ''; }, 1000); // Clear outline sooner
             }, 50); // Small delay to ensure response is sent first
 
-            return { success: true, data: { searched: value } };
+            return { success: true, data: { searched: searchValue } };
+        }
+
+        case 'assert_visible': {
+            if (!selector) throw new Error('assert_visible requires a selector');
+            const el = findElement(selector);
+            if (!el) return { success: false, error: `assert_visible failed: element not found (${selector})` };
+            if (!isVisible(el)) return { success: false, error: `assert_visible failed: element is not visible (${selector})` };
+            return { success: true, data: { selector, visible: true } };
+        }
+
+        case 'assert_text': {
+            if (!selector) throw new Error('assert_text requires a selector');
+            const expected = String(expectedText ?? value ?? '').trim();
+            if (!expected) throw new Error('assert_text requires expectedText');
+            const el = findElement(selector);
+            if (!el) return { success: false, error: `assert_text failed: element not found (${selector})` };
+            const actual = (el.innerText || el.textContent || '').trim();
+            if (!actual.includes(expected)) {
+                return {
+                    success: false,
+                    error: `assert_text failed: expected "${expected}" to be present`,
+                    data: { selector, actual: actual.slice(0, 500) },
+                };
+            }
+            return { success: true, data: { selector, expectedText: expected } };
+        }
+
+        case 'iframe_action': {
+            if (!iframeSelector) throw new Error('iframe_action requires iframeSelector');
+            if (!innerAction || typeof innerAction !== 'object') throw new Error('iframe_action requires innerAction object');
+
+            const frame = safeQuerySelector(iframeSelector) as HTMLIFrameElement | null;
+            if (!frame) throw new Error(`iframe not found: ${iframeSelector}`);
+            const doc = frame.contentDocument;
+            if (!doc) {
+                return { success: false, error: 'Cannot access iframe document (likely cross-origin)' };
+            }
+
+            const nested = innerAction as {
+                action?: string;
+                selector?: string;
+                value?: string | number;
+                expectedText?: string;
+            };
+
+            const nestedAction = nested.action;
+            const nestedSelector = nested.selector;
+            if (!nestedAction || !nestedSelector) {
+                return { success: false, error: 'innerAction must include action and selector' };
+            }
+
+            const nestedEl = (() => {
+                try { return doc.querySelector(nestedSelector) as HTMLElement | null; } catch { return null; }
+            })();
+            if (!nestedEl) {
+                return { success: false, error: `iframe inner selector not found: ${nestedSelector}` };
+            }
+
+            if (nestedAction === 'click') {
+                nestedEl.click();
+                return { success: true, data: { iframeSelector, action: nestedAction, selector: nestedSelector } };
+            }
+            if (nestedAction === 'focus') {
+                nestedEl.focus();
+                return { success: true, data: { iframeSelector, action: nestedAction, selector: nestedSelector } };
+            }
+            if (nestedAction === 'clear' || nestedAction === 'set_value' || nestedAction === 'type') {
+                const input = nestedEl as HTMLInputElement | HTMLTextAreaElement;
+                if (!(input instanceof HTMLInputElement || input instanceof HTMLTextAreaElement)) {
+                    return { success: false, error: `inner action ${nestedAction} requires input/textarea target` };
+                }
+                const nextValue = nestedAction === 'clear' ? '' : String(nested.value ?? '');
+                const setter = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(input), 'value')?.set;
+                if (setter) setter.call(input, nextValue);
+                else input.value = nextValue;
+                input.dispatchEvent(new Event('input', { bubbles: true }));
+                input.dispatchEvent(new Event('change', { bubbles: true }));
+                return { success: true, data: { iframeSelector, action: nestedAction, selector: nestedSelector } };
+            }
+            if (nestedAction === 'assert_visible') {
+                const style = doc.defaultView?.getComputedStyle(nestedEl);
+                const visible = !!style && style.display !== 'none' && style.visibility !== 'hidden' && style.opacity !== '0';
+                if (!visible) return { success: false, error: `iframe assert_visible failed: ${nestedSelector}` };
+                return { success: true, data: { iframeSelector, action: nestedAction, selector: nestedSelector } };
+            }
+            if (nestedAction === 'assert_text') {
+                const expected = String(nested.expectedText ?? nested.value ?? '').trim();
+                const actual = (nestedEl.textContent ?? '').trim();
+                if (!expected || !actual.includes(expected)) {
+                    return { success: false, error: `iframe assert_text failed: expected "${expected}"` };
+                }
+                return { success: true, data: { iframeSelector, action: nestedAction, selector: nestedSelector } };
+            }
+
+            return { success: false, error: `iframe inner action not supported: ${nestedAction}` };
         }
 
         default:
@@ -2609,6 +3308,15 @@ function extractElements(
         const tag = htmlChild.tagName.toLowerCase();
 
         if (['script', 'style', 'noscript', 'svg', 'path'].includes(tag)) continue;
+
+        // Skip layout/UI control elements that should never be targets for user actions
+        const className = (htmlChild.className?.toString() || '').toLowerCase();
+        const id = (htmlChild.id?.toString() || '').toLowerCase();
+        if (className.includes('resizer') || className.includes('splitter') || 
+            className.includes('divider') || className.includes('layout-handle') ||
+            id.includes('resizer') || id.includes('splitter') || id.includes('divider')) {
+            continue;
+        }
 
         const element: DOMElement = { tag };
 

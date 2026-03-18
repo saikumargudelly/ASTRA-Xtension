@@ -34,6 +34,10 @@ async function dispatchChat(
 
     try {
         switch (config.provider) {
+            case 'openrouter': {
+                const { chat } = await import('../llm/providers/openrouter.js');
+                return await chat(messages, config.model, config.maxTokens, config.temperature);
+            }
             case 'groq': {
                 const { chat } = await import('../llm/providers/groq.js');
                 return await chat(messages, config.model, config.maxTokens, config.temperature);
@@ -57,9 +61,17 @@ async function dispatchChat(
             }
         }
     } catch (err) {
-        // Mark provider unavailable, retry with fallback
-        router.markProviderUnavailable(config.provider);
-        console.warn(`[LLMRouter] ${config.provider} failed, using fallback`);
+        // Check if this is a configuration error (4xx) - don't mark unavailable for these
+        const isConfigError = err instanceof Error && 
+            (err.message.includes('400') || err.message.includes('413') || err.message.includes('PAYLOAD_TOO_LARGE'));
+        
+        if (!isConfigError) {
+            // Mark provider unavailable only for transient errors (rate limits, network issues)
+            router.markProviderUnavailable(config.provider);
+            console.warn(`[LLMRouter] ${config.provider} failed, using fallback`);
+        } else {
+            console.warn(`[LLMRouter] ${config.provider} config error (not marking unavailable):`, err.message.substring(0, 100));
+        }
 
         const fallbackConfig = router.route(taskType, constraints);
         if (fallbackConfig.provider === config.provider) {
@@ -137,6 +149,11 @@ export async function* chatStream(
     console.log(`[LLMRouter] Streaming '${taskType}' → ${config.provider}/${config.model}`);
 
     switch (config.provider) {
+        case 'openrouter': {
+            const { chatStream } = await import('../llm/providers/openrouter.js');
+            yield* chatStream(messages, config.model, config.maxTokens);
+            break;
+        }
         case 'groq': {
             const { chatStream } = await import('../llm/providers/groq.js');
             yield* chatStream(messages, config.model, config.maxTokens);

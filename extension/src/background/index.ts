@@ -30,7 +30,7 @@ import {
     isRestrictedUrl,
     getAuditLog,
     type BrowserContext,
-} from './browser-actions.js';
+} from './browser-actions';
 import { validateUrl } from './security.js';
 
 // ─── Configuration ───────────────────────────────────────────────────────────
@@ -154,6 +154,79 @@ async function clearState(): Promise<void> {
     try { await chrome.storage.session.remove('astra_state'); } catch { /* ignore */ }
 }
 
+function coercePositiveInt(value: unknown): number | undefined {
+    if (typeof value === 'number' && Number.isFinite(value) && value >= 0) {
+        return Math.floor(value);
+    }
+    if (typeof value === 'string') {
+        const parsed = Number.parseInt(value, 10);
+        if (Number.isFinite(parsed) && parsed >= 0) return parsed;
+    }
+    return undefined;
+}
+
+function normalizePlannerAction(raw: Record<string, any>): PlannerAction {
+    const type = String(raw.action ?? raw.type ?? '').trim();
+    const label = (typeof raw.label === 'string' && raw.label.trim())
+        ? raw.label.trim()
+        : ((typeof raw.reason === 'string' && raw.reason.trim()) ? raw.reason.trim() : type);
+
+    const normalized: Record<string, unknown> = { ...raw, type, label };
+
+    if (typeof raw.selector === 'string') normalized.selector = raw.selector;
+    if (typeof raw.value === 'string') normalized.value = raw.value;
+    if (typeof raw.reason === 'string') normalized.reason = raw.reason;
+    if (Array.isArray(raw.options)) normalized.options = raw.options;
+    if (typeof raw.category === 'string') normalized.category = raw.category;
+
+    const elementIdx = coercePositiveInt(raw.elementIdx);
+    if (elementIdx !== undefined) normalized.elementIdx = elementIdx;
+
+    // Backward/forward compatibility across planner payload variants.
+    if (type === 'open_tab' || type === 'new_tab' || type === 'navigate') {
+        const urlCandidate = typeof raw.url === 'string'
+            ? raw.url
+            : (typeof raw.value === 'string'
+                ? raw.value
+                : (typeof raw.selector === 'string' ? raw.selector : undefined));
+        if (urlCandidate) normalized.url = urlCandidate;
+    }
+
+    if (type === 'switch_tab' || type === 'close_tab') {
+        const tabId = coercePositiveInt(raw.tabId) ?? elementIdx;
+        if (tabId !== undefined) normalized.tabId = tabId;
+    }
+
+    if (type === 'wait') {
+        const duration = coercePositiveInt(raw.duration) ?? coercePositiveInt(raw.value);
+        if (duration !== undefined) normalized.duration = duration;
+    }
+
+    if (type === 'scroll') {
+        const amount = coercePositiveInt(raw.amount) ?? coercePositiveInt(raw.value);
+        if (amount !== undefined) normalized.amount = amount;
+        if (typeof raw.direction === 'string') normalized.direction = raw.direction;
+    }
+
+    return normalized as PlannerAction;
+}
+
+function actionSignature(actions: PlannerAction[]): string {
+    return actions
+        .map((a) => {
+            const extras = a as Record<string, unknown>;
+            return [
+                a.type,
+                String(a.elementIdx ?? ''),
+                String(a.selector ?? ''),
+                String(a.value ?? ''),
+                String(extras.url ?? ''),
+                String(extras.tabId ?? ''),
+            ].join('|');
+        })
+        .join('||');
+}
+
 // ─── Message Listener ─────────────────────────────────────────────────────────
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     if (message.type === 'SUBMIT_COMMAND') {
@@ -231,6 +304,7 @@ async function handleCommand(message: SubmitCommandMessage) {
         // ── Step 1: Capture full browser context ─────────────────────────
         sendProgress(1, 5, 'Capturing browser context...', 'running', 'coordinator');
         const ctx: BrowserContext = await getBrowserContext();
+        // Capture once and reuse for initial planning to avoid duplicate screenshot cost.
         const screenshot = await captureScreenshot();
         const region = inferRegionFromUrl(ctx.activeTab?.url) ?? localeToRegion(locale);
         const context = ctx.activeTab
@@ -332,7 +406,7 @@ async function handleCommand(message: SubmitCommandMessage) {
 
             // Wait for page to fully load
             await waitForTabLoad(navTabId, 15_000);
-            await sleep(2000); // Extra settle time for SPAs (React/Netflix/etc)
+            await sleep(800); // Brief settle time for SPAs (React/Netflix/etc)
             console.log('[ASTRA] Pre-nav: tab loaded, navTabId =', navTabId);
         }
 
@@ -348,21 +422,27 @@ async function handleCommand(message: SubmitCommandMessage) {
                     { type: 'search', value: searchQuery, label: `Search: ${searchQuery}` } as PlannerAction,
                     freshCtx, sessionId,
                 ).catch(() => { /* non-fatal */ });
-                await sleep(2500);
+                await sleep(1400);
             }
         }
 
         // Multi-round snapshot → plan → execute loop
         let actionsApplied = 0;
-        const MAX_ROUNDS = 10;  // Generous for multi-step conversational flows
+        const MAX_ROUNDS = 8;  // Prevent long replan loops while keeping enough room for multi-step tasks
         const sessionHistory: Array<{ action: string; label: string; elementIdx?: number; success?: boolean; error?: string }> = [];
         let lastSnapshotSig = '';
         let userFollowUpContext = '';  // Injected when user answers a follow-up question
         let consecutiveEmptyRounds = 0; // Track when planner keeps returning nothing
+        let consecutiveFailedRounds = 0;
+        let repeatedPlanRounds = 0;
+        let lastPlanSig = '';
         let lastPageUrl = '';  // Detect URL changes mid-loop
+        let stopReason: 'rate_limit' | 'repeated_plan' | 'repeated_failures' | null = null;
         let lastRoundHadZeroActions = false; // Hint for next round when plan produced no valid actions
+        const taskStartTime = Date.now();
 
         for (let round = 0; round < MAX_ROUNDS; round++) {
+            const roundStartTime = Date.now();
             const roundCtx = await getBrowserContext();
             const activeT = roundCtx.activeTab;
             if (!activeT || isRestrictedUrl(activeT.url)) break;
@@ -382,7 +462,7 @@ async function handleCommand(message: SubmitCommandMessage) {
 
                 if (!snapResp?.success || !snapResp.data?.interactiveElements?.length) {
                     // Page might still be loading — retry with increasing delay
-                    const retryDelay = round === 0 ? 3000 : 2000;  // Longer on first round (just navigated)
+                    const retryDelay = round === 0 ? 1500 : 1200;
                     console.log(`[ASTRA] Round ${round}: snapshot empty/failed, retrying after ${retryDelay}ms...`);
                     await sleep(retryDelay);
                     const retrySnap = await sendToTab(activeT.tabId, {
@@ -472,8 +552,10 @@ async function handleCommand(message: SubmitCommandMessage) {
                 // of 413 errors, excessive token usage, and rate-limit burnout.
                 // Unchanged pages need no vision re-analysis — the DOM snapshot is sufficient.
                 const shouldCaptureScreenshot = round === 0 || urlChanged || (pageContentChanged && round > 0);
+                // Reuse the initial screenshot for round 0 (already captured for /intent).
+                // For later rounds, only capture when needed.
                 const roundScreenshot = shouldCaptureScreenshot
-                    ? await captureScreenshot().catch(() => null)
+                    ? (round === 0 ? screenshot : await captureScreenshot().catch(() => null))
                     : null;
                 if (!shouldCaptureScreenshot) {
                     console.log(`[ASTRA] Round ${round + 1}: skipping screenshot (URL and content unchanged)`);
@@ -509,10 +591,7 @@ async function handleCommand(message: SubmitCommandMessage) {
                 };
 
                 // ── Map server field names: PlannedAction uses `action` field, PlannerAction uses `type` ─
-                const actions: PlannerAction[] = (rawPlanResult.actions ?? []).map(a => ({
-                    ...a,
-                    type: a.action || a.type, // server returns `action`, we need `type`
-                } as PlannerAction));
+                const actions: PlannerAction[] = (rawPlanResult.actions ?? []).map(normalizePlannerAction);
 
                 // ─── Handle ask_user: the planner wants to ask the user something ───
                 // Check both the top-level askUser flag and any ask_user actions in the list
@@ -526,6 +605,7 @@ async function handleCommand(message: SubmitCommandMessage) {
 
                 if (askPayload) {
                     console.log(`[ASTRA] 🗣️ Asking user: "${askPayload.question}" (${askPayload.category})`);
+                    console.log(`[DEBUG|Background] ask_user triggered: ${JSON.stringify({ question: askPayload.question, options: askPayload.options, category: askPayload.category })}`);
                     sendProgress(3, 5, `🗣️ ${askPayload.question}`, 'running', 'browser');
 
                     try {
@@ -563,11 +643,11 @@ async function handleCommand(message: SubmitCommandMessage) {
                             if (clickResult.success) {
                                 sessionHistory.push({ action: 'click', label: matchingElement.label, elementIdx: matchingElement.idx, success: true });
                                 actionsApplied++;
-                                await sleep(2500); // Wait for page transition
+                                await sleep(1300); // Wait for page transition
                                 // Wait for potential page load after click
                                 const postClickCtx = await getBrowserContext();
                                 if (postClickCtx.activeTab?.loading) {
-                                    await sleep(3000);
+                                    await sleep(1200);
                                 }
                                 console.log(`[ASTRA] ✅ Auto-click succeeded — page should have changed`);
                             } else {
@@ -583,7 +663,7 @@ async function handleCommand(message: SubmitCommandMessage) {
                         }
 
                         sendProgress(3, 5, `User chose: ${userAnswer}`, 'running', 'browser');
-                        await sleep(500);
+                        await sleep(250);
                         continue; // Re-snapshot and re-plan
                     } catch (followUpErr) {
                         console.warn('[ASTRA] Follow-up timed out or errored:', followUpErr);
@@ -595,9 +675,35 @@ async function handleCommand(message: SubmitCommandMessage) {
                 // Filter out ask_user from executable actions (already handled above)
                 const executableActions = actions.filter(a => a.type !== 'ask_user');
 
+                const currentPlanSig = actionSignature(executableActions);
+                if (currentPlanSig && currentPlanSig === lastPlanSig) {
+                    repeatedPlanRounds++;
+                } else {
+                    repeatedPlanRounds = 0;
+                }
+                lastPlanSig = currentPlanSig;
+
                 // Track when server returned no valid executable actions so next round gets a hint
                 lastRoundHadZeroActions = executableActions.length === 0;
+
+                // ── Explicit Task Complete Signal ──
+                const taskCompleteAction = executableActions.find(a => a.type === 'task_complete');
+                if (taskCompleteAction) {
+                    console.log(`[ASTRA] ✅ LLM signaled task complete: ${taskCompleteAction.reason}`);
+                    sendProgress(3, 5, `✅ Task Complete: ${taskCompleteAction.reason || 'Goal achieved'}`, 'done', 'browser');
+                    break;
+                }
+
+                if (repeatedPlanRounds >= 2 && executableActions.length > 0) {
+                    stopReason = 'repeated_plan';
+                    console.warn('[ASTRA] Planner repeated effectively the same action set for 3 rounds — stopping loop.');
+                    sendProgress(3, 5, '⚠ Planner repeated the same steps. Stopping to avoid loop.', 'running', 'browser');
+                    break;
+                }
+
                 if (executableActions.length === 0) {
+                    lastPlanSig = '';
+                    repeatedPlanRounds = 0;
                     // ── GoalEval: did the backend confirm task is complete? ──
                     const ge = rawPlanResult.goalEval;
                     if (ge && ge.status === 'complete' && ge.confidence >= 0.75) {
@@ -612,30 +718,64 @@ async function handleCommand(message: SubmitCommandMessage) {
                         // Still fall through to the empty-round counter so we don't break too early
                     }
                     consecutiveEmptyRounds++;
+                    console.log(`[ASTRA] Round ${round + 1}: no executable actions (consecutiveEmptyRounds=${consecutiveEmptyRounds})`);
                     if (consecutiveEmptyRounds >= 2) {
                         console.log(`[ASTRA] ${consecutiveEmptyRounds} empty rounds — stopping`);
                         break;
                     }
                     console.log(`[ASTRA] Round ${round + 1}: no new actions — will retry once more`);
-                    await sleep(1500);
+                    await sleep(800);
                     continue;
                 }
                 consecutiveEmptyRounds = 0; // Reset on valid actions
+                
+                console.log(`[ASTRA] Round ${round + 1}: Executing ${executableActions.length} action(s): ${executableActions.map(a => a.type).join(', ')}`);
 
                 let roundCount = 0;
-                for (const action of executableActions) {
+                let roundHitRateLimit = false;
+                for (const [idx, action] of executableActions.entries()) {
                     // Refresh context before each action (tab may have changed)
                     const actionCtx = await getBrowserContext();
+                    const actionStart = Date.now();
                     console.log(`[ASTRA] ▶ ${action.type}: "${action.label}" (${action.selector ?? action.value ?? action.elementIdx ?? ''})`);
                     sendProgress(3, 5, `▶ ${action.label}`, 'running', 'browser');
 
+                    // Send action start progress
+                    sendActionProgress({
+                        actionIndex: actionsApplied + idx,
+                        totalActions: sessionHistory.length + executableActions.length,
+                        type: action.type,
+                        label: action.label,
+                        status: 'executing',
+                        emoji: getActionEmoji(action.type),
+                    });
+
                     const result = await dispatchPlannerAction(action, actionCtx, sessionId);
+                    const actionDuration = Date.now() - actionStart;
+                    console.log(`[ASTRA] ◀ ${action.type} result: ${result.success ? 'SUCCESS' : 'FAILED'} (${actionDuration}ms)${result.error ? ` - ${result.error}` : ''}`);
 
                     if (result.blocked) {
                         console.warn(`[ASTRA|SECURITY] Blocked: ${result.error}`);
                         sendProgress(3, 5, `⚠️ Blocked: ${result.error}`, 'running', 'critic');
+                        
+                        // Send failed action progress
+                        sendActionProgress({
+                            actionIndex: actionsApplied + idx,
+                            totalActions: sessionHistory.length + executableActions.length,
+                            type: action.type,
+                            label: action.label,
+                            status: 'failed',
+                            emoji: '🛡️',
+                            error: `Security blocked`,
+                        });
+                        
                         sessionHistory.push({ action: action.type, label: action.label, elementIdx: action.elementIdx, success: false, error: `Security blocked: ${result.error}` });
-                        // Don't abort on a blocked action — skip and continue
+                        if ((result.error ?? '').includes('Rate limit exceeded')) {
+                            roundHitRateLimit = true;
+                            stopReason = 'rate_limit';
+                            break;
+                        }
+                        // Don't abort on non-rate-limit blocked actions — skip and continue
                         continue;
                     }
 
@@ -644,37 +784,79 @@ async function handleCommand(message: SubmitCommandMessage) {
                         roundCount++;
                         actionsApplied++;
 
+                        // Send success action progress
+                        const successMsg = getActionSuccessMessage(action.type, action.label);
+                        sendActionProgress({
+                            actionIndex: actionsApplied - 1 + idx,
+                            totalActions: sessionHistory.length + executableActions.length,
+                            type: action.type,
+                            label: action.label,
+                            status: 'success',
+                            emoji: getActionEmoji(action.type),
+                            result: successMsg,
+                        });
+
                         // Adaptive post-action delay based on action type
-                        const isNav = ['open_tab', 'navigate', 'new_tab', 'go_back', 'go_forward', 'new_window', 'press_enter'].includes(action.type);
+                        const isNav = ['open_tab', 'navigate', 'new_tab', 'go_back', 'go_forward', 'new_window'].includes(action.type);
+                        const isPressEnter = action.type === 'press_enter';
                         const isClick = action.type === 'click';
-                        await sleep(isNav ? 2500 : (isClick ? 1500 : 800));
+                        
+                        await sleep(isNav ? 1200 : (isClick ? 900 : 500));
+                        if (isPressEnter) {
+                            await sleep(1100); // Wait for search results or forms to initiate load
+                        }
                         
                         // After navigation actions AND press_enter (which triggers form/search submit
                         // causing a full page load), wait for the tab to finish loading.
-                        if (isNav) {
+                        if (isNav || isPressEnter) {
                             const postNavCtx = await getBrowserContext();
                             if (postNavCtx.activeTab?.loading) {
-                                await sleep(3000); // Extra wait for slow pages
+                                await sleep(1800); // Extra wait for slow pages
                             }
                             // Additional settle for search result pages that lazy-render
-                            if (action.type === 'press_enter') await sleep(1000);
+                            if (isPressEnter) await sleep(600);
                         }
                     } else {
                         console.log(`[ASTRA] Action "${action.label}" failed: ${result.error}`);
+                        
+                        // Send failed action progress
+                        sendActionProgress({
+                            actionIndex: actionsApplied + idx,
+                            totalActions: sessionHistory.length + executableActions.length,
+                            type: action.type,
+                            label: action.label,
+                            status: 'failed',
+                            emoji: '❌',
+                            error: result.error ?? 'Unknown error',
+                        });
+                        
                         sessionHistory.push({ action: action.type, label: action.label, elementIdx: action.elementIdx, success: false, error: result.error });
                         sendProgress(3, 5, `⚠️ ${action.label} failed — adapting...`, 'running', 'browser');
                     }
                 }
 
+                if (roundHitRateLimit) {
+                    sendProgress(3, 5, '⚠ Action rate limit reached. Ending this run.', 'running', 'critic');
+                    break;
+                }
+
                 if (roundCount > 0) {
-                    await sleep(1800); // Let page settle before re-snapshotting
+                    consecutiveFailedRounds = 0;
+                    await sleep(900); // Let page settle before re-snapshotting
                 } else {
                     // All actions in this round failed — don't break immediately
                     // Give the planner a chance to adapt with failure feedback
                     const allFailed = executableActions.length > 0;
                     if (allFailed) {
+                        consecutiveFailedRounds++;
                         console.log(`[ASTRA] Round ${round + 1}: all actions failed — replanning with failure context`);
-                        await sleep(1000);
+                        if (consecutiveFailedRounds >= 3) {
+                            stopReason = 'repeated_failures';
+                            console.warn('[ASTRA] Multiple consecutive failed rounds — stopping loop.');
+                            sendProgress(3, 5, '⚠ Multiple rounds failed. Stopping to avoid loop.', 'running', 'browser');
+                            break;
+                        }
+                        await sleep(700);
                         // Don't break — the planner will get the failure info via sessionHistory
                     } else {
                         break;
@@ -685,10 +867,19 @@ async function handleCommand(message: SubmitCommandMessage) {
                 console.log(`[ASTRA] Round ${round + 1} non-fatal:`, roundErr);
                 break;
             }
+            const roundDuration = Date.now() - roundStartTime;
+            const totalDuration = Date.now() - taskStartTime;
+            console.log(`[PERF] ${JSON.stringify({location:'background/index.ts', event: 'round_complete', round: round + 1, roundDuration_ms: roundDuration, totalDuration_ms: totalDuration, actionsApplied})}`);
         }
 
         sendProgress(3, 5,
-            actionsApplied > 0 ? `✓ ${actionsApplied} action(s) executed` : 'Ready',
+            actionsApplied > 0
+                ? `✓ ${actionsApplied} action(s) executed`
+                : (stopReason === 'rate_limit'
+                    ? 'Stopped: action rate limit reached'
+                    : (stopReason === 'repeated_plan'
+                        ? 'Stopped: repeated action plan detected'
+                        : (stopReason === 'repeated_failures' ? 'Stopped: repeated failures' : 'Ready'))),
             'done', 'browser',
         );
 
@@ -712,7 +903,24 @@ async function handleCommand(message: SubmitCommandMessage) {
                 isSearchResults: hasSearch,
             }),
         });
-        if (!analyzeRes.ok) throw new Error(`Analysis error: ${analyzeRes.status}`);
+        if (!analyzeRes.ok) {
+            const errBody = await analyzeRes.text().catch(() => '');
+            const fallbackSummary = actionsApplied > 0
+                ? 'Actions were executed, but the final summarizer could not complete. The page likely changed as requested.'
+                : 'ASTRA could not complete final page analysis in this run.';
+            const payload = {
+                success: true,
+                data: {},
+                summary: `${fallbackSummary}${errBody ? ` (analyze: ${errBody.slice(0, 160)})` : ''}`,
+                rankedResults: [],
+                actionLog: getAuditLog(sessionId),
+            };
+            await saveState({ status: 'done', result: payload });
+            chrome.runtime.sendMessage({ type: 'COMMAND_RESULT', payload }).catch(() => {
+                console.log('[ASTRA] Popup closed — state preserved in session.');
+            });
+            return;
+        }
         const result = await analyzeRes.json();
         sendProgress(5, 5, '✅ Done', 'done', 'summarizer');
         await sleep(100);
@@ -782,7 +990,7 @@ async function analyzeCurrentPage(): Promise<PageAnalysisData | null> {
     try {
         const response = await sendToTab(tabId, {
             type: 'ANALYZE_PAGE',
-            payload: { maxScrolls: 15, scrollDelay: 400, includeStructure: true },
+            payload: { maxScrolls: 9, scrollDelay: 280, includeStructure: true },
         } as AnalyzePageMessage, url) as { success: boolean; data?: PageAnalysisData; error?: string };
 
         if (response?.success) return response.data as PageAnalysisData;
@@ -828,6 +1036,59 @@ function sendProgress(
     if (existing >= 0) MemorySteps[existing] = progressPayload;
     else MemorySteps.push(progressPayload);
     saveState({ steps: MemorySteps });
+}
+
+// ─── Action-Level Progress: Broadcast detailed action-by-action execution status ──
+interface ActionProgress {
+    actionIndex: number;
+    totalActions: number;
+    type: string;
+    label: string;
+    status: 'pending' | 'executing' | 'success' | 'failed';
+    result?: string;
+    error?: string;
+    emoji?: string;
+}
+
+function sendActionProgress(progress: ActionProgress) {
+    chrome.runtime.sendMessage({ type: 'ACTION_PROGRESS', payload: progress }).catch(() => { });
+}
+
+// ─── Action UI Helpers ───────────────────────────────────────────────────────────
+function getActionEmoji(actionType: string): string {
+    const emojiMap: Record<string, string> = {
+        click: '🖱️', type: '⌨️', scroll: '↕️', navigate: '🌐', open_tab: '📑',
+        close_tab: '❌', wait: '⏳', hover: '👆', drag_and_drop: '🎯',
+        select_option: '✓', press_enter: '↩️', search: '🔍', ask_user: '🗣️',
+        screenshot: '📸', submit_form: '📤', fill_form: '📋', focus: '✨',
+        clear: '🗑️', copy_text: '📋', highlight: '🌟', keyboard: '⌨️',
+        dismiss_dialog: '✕', extract_data: '🔑', assert_visible: '👁️', assert_text: '📖',
+        read_page: '📖', analyze_page: '🔍', iframe_action: '📦', upload_file: '📁',
+        set_value: '✎', toggle_checkbox: '☑️', range_set: '🎚️', double_click: '🖱️🖱️',
+        right_click: '🖱️➜', multi_click: '🖱️x', go_back: '← ', go_forward: '→',
+        reload_tab: '🔄', pin_tab: '📌', mute_tab: '🔇', zoom_tab: '🔍',
+        get_all_tabs: '📑', search_tabs: '🔍', bookmark_page: '🔖', download_file: '⬇️',
+    };
+    return emojiMap[actionType] ?? '⚙️';
+}
+
+function getActionSuccessMessage(actionType: string, label: string): string {
+    switch (actionType) {
+        case 'click': return `Clicked element`;
+        case 'type': return `Text entered`;
+        case 'scroll': return `Page scrolled`;
+        case 'navigate': return `Navigation complete`;
+        case 'open_tab': return `New tab opened`;
+        case 'close_tab': return `Tab closed`;
+        case 'wait': return `Wait finished`;
+        case 'hover': return `Element hovered`;
+        case 'drag_and_drop': return `Drag completed`;
+        case 'select_option': return `Option selected`;
+        case 'submit_form': return `Form submitted`;
+        case 'search': return `Search executed`;
+        case 'ask_user': return `User asked`;
+        default: return `Action completed`;
+    }
 }
 
 console.log('[ASTRA] Background service worker initialized (browser-centric v2)');

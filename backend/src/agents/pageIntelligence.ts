@@ -46,7 +46,7 @@ export interface ParsedIntent {
 }
 
 export interface PlannedAction {
-    action: 'click' | 'type' | 'select-option' | 'range-set' | 'wait' | 'scroll' | 'navigate' | 'new_tab' | 'switch_tab' | 'close_tab' | 'ask_user' | 'press_enter';
+    action: 'click' | 'type' | 'select-option' | 'range-set' | 'wait' | 'scroll' | 'navigate' | 'new_tab' | 'switch_tab' | 'close_tab' | 'ask_user' | 'press_enter' | 'task_complete';
     selector: string;     // For DOM: css selector. For Browser: URL or "tabId"
     value?: string;       // For type/navigate. For ask_user: the question to ask
     label: string;
@@ -327,52 +327,65 @@ export async function planPageActions(
         );
         const isFirstRound = !executedActions?.length;
         if (isFirstRound || isPageTransition) {
+            const visionStart = Date.now();
+            
+            // OPTIMIZATION: Run both vision calls in PARALLEL instead of sequentially
+            // analyzeScreen and identifyElements are independent - no need to wait for one before starting the other
             try {
-                const visual = await analyzeScreen(screenshot, originalQuery);
-                visualContextSection = [
-                    '\nVISUAL PAGE ANALYSIS (from screenshot — what the page LOOKS like):',
-                    `- Page type: ${visual.pageType}`,
-                    `- Visual description: ${visual.mainContentDescription}`,
-                    `- Suggested action: ${visual.suggestedAction}`,
-                    `- Has search box: ${visual.hasSearchBox}`,
-                    visual.searchInputHint ? `- Search input hint: ${visual.searchInputHint}` : '',
-                    visual.uiElements.length
-                        ? `- Key UI elements seen:\n${visual.uiElements.slice(0, 5).map(e => `    [${e.type}] ${e.description}`).join('\n')}`
-                        : '',
-                ].filter(Boolean).join('\n') + '\n';
+                const [visual, visionMap] = await Promise.all([
+                    analyzeScreen(screenshot, originalQuery).catch(err => {
+                        console.warn('[PageIntelligence] analyzeScreen failed:', err.message);
+                        return null;
+                    }),
+                    identifyElements(
+                        screenshot,
+                        elementsToUse.slice(0, 30).map(e => ({ idx: e.idx, type: e.type, label: e.label })),
+                        originalQuery,
+                    ).catch(err => {
+                        console.warn('[PageIntelligence] identifyElements failed:', err.message);
+                        return [];
+                    }),
+                ]);
+                
+                const visionDuration = Date.now() - visionStart;
+                const logEntry = JSON.stringify({location:'pageIntelligence.ts:vision', timestamp: new Date().toISOString(), event: 'vision_parallel', duration_ms: visionDuration, analyzeScreen: !!visual, identifyElements: visionMap?.length ?? 0});
+                console.log(`[PERF] ${logEntry}`);
+                
+                if (visual) {
+                    visualContextSection = [
+                        '\nVISUAL PAGE ANALYSIS (from screenshot — what the page LOOKS like):',
+                        `- Page type: ${visual.pageType}`,
+                        `- Visual description: ${visual.mainContentDescription}`,
+                        `- Suggested action: ${visual.suggestedAction}`,
+                        `- Has search box: ${visual.hasSearchBox}`,
+                        visual.searchInputHint ? `- Search input hint: ${visual.searchInputHint}` : '',
+                        visual.uiElements.length
+                            ? `- Key UI elements seen:\n${visual.uiElements.slice(0, 5).map(e => `    [${e.type}] ${e.description}`).join('\n')}`
+                            : '',
+                    ].filter(Boolean).join('\n') + '\n';
+                }
+                
+                // Process element mapping results
+                if (visionMap && visionMap.length > 0) {
+                    const hints = visionMap
+                        .filter(v => v.confidence >= 60)
+                        .map(v => `  idx:${v.domIdx} → ${v.visualRole}`)
+                        .join('\n');
+                    if (hints) {
+                        visualContextSection += `\nVISION ELEMENT MAP (what Vision actually sees on screen):\n${hints}\n` +
+                            `→ Use these visual descriptions to pick the CORRECT elementIdx for each step.\n`;
+                    }
+                }
             } catch (err) {
-                        // Vision failure is non-fatal — DOM snapshot is still the primary source
+                // Vision failure is non-fatal — DOM snapshot is still the primary source
                 console.warn('[PageIntelligence] Vision analysis skipped:', (err as Error).message);
             }
         }
-
-        // ── Vision element mapping (every round) ────────────────────────────
-        // Ask Vision to confirm which DOM elements are visually present on screen
-        // and what each one actually looks like. Gives the planner accurate labels:
-        // e.g. "idx 1 is the magnifying-glass search submit button" instead of raw DOM text.
-        try {
-            const visionMap = await identifyElements(
-                screenshot,
-                elementsToUse.slice(0, 30).map(e => ({ idx: e.idx, type: e.type, label: e.label })),
-                originalQuery,
-            );
-            if (visionMap.length > 0) {
-                const hints = visionMap
-                    .filter(v => v.confidence >= 60)
-                    .map(v => `  idx:${v.domIdx} → ${v.visualRole}`)
-                    .join('\n');
-                if (hints) {
-                    visualContextSection += `\nVISION ELEMENT MAP (what Vision actually sees on screen):\n${hints}\n` +
-                        `→ Use these visual descriptions to pick the CORRECT elementIdx for each step.\n`;
-                }
-            }
-        } catch {
-            // non-fatal
-        }
     }
 
-    const historySection = executedActions?.length
-        ? `\nACTIONS ALREADY EXECUTED (DO NOT REPEAT):\n${executedActions.map((a, i) => {
+    const recentExecutedActions = executedActions?.slice(-18);
+    const historySection = recentExecutedActions?.length
+        ? `\nACTIONS ALREADY EXECUTED (DO NOT REPEAT):\n${recentExecutedActions.map((a, i) => {
             const status = (a as any).failed ? '❌ FAILED' : '✅ OK';
             const reason = (a as any).failReason ? ` — reason: ${(a as any).failReason}` : '';
             return `  ${i + 1}. [${status}] ${a.action}: ${a.label}${reason}`;
@@ -440,7 +453,7 @@ ${fullStateFeedback}
 ${browserContextSection}
 
 VISIBLE TEXT (excerpt — use this to understand the current screen state):
-${activePage.visibleText.slice(0, 1200)}
+${activePage.visibleText.slice(0, 800)}
 
 INTERACTIVE ELEMENTS (Active Tab) — use ONLY these [idx] values for DOM clicks/typing:
 ${elementList}
@@ -473,15 +486,24 @@ Before planning actions, first classify the current screen:
 🔹 "ARE YOU STILL THERE?" / SESSION TIMEOUT: Idle prompts or "Continue watching?":
    → AUTO-DISMISS: Click the continue/resume button.
 
-🔹 DISAMBIGUATION: Multiple matching results or unclear which item to select:
-   → ASK USER: Present the top options and ask which one.
-   → category: disambiguation
+🔹 DISAMBIGUATION (STRICT — CRITICAL FOR MUSIC/VIDEO TASKS): 
+   If the page shows MULTIPLE search results (songs, videos, products) with similar names:
+   → DO NOT auto-click the first result!
+   → You MUST emit ask_user so the user can choose which one they want.
+   → Look at the INTERACTIVE ELEMENTS list for items matching the search query.
+   → action: ask_user | value: I found multiple results for "${intent.searchQuery || originalQuery}". Which one should I play? | label: Choose result | options: [first 3-5 matching item labels from the page] | category: disambiguation
+   → EXAMPLE for "play blinding lights": If you see multiple items with "Blinding Lights" or similar, ask:
+      action: ask_user | value: I found multiple songs matching "blinding lights". Which one should I play? | label: Song selection | options: Blinding Lights - The Weeknd, Blinding Lights (Original), Blinding Lights - Live Version, ... | category: disambiguation
 
 🔹 POPUP/MODAL/OVERLAY: App install prompts, notification permission dialogs, survey popups:
    → AUTO-DISMISS: Click close/dismiss/skip/no thanks. Do NOT ask the user.
 
 🔹 NORMAL PAGE: The page is directly relevant to the goal:
    → Proceed with normal action planning.
+
+🔹 TASK COMPLETE: If the user's goal is fully achieved (e.g., song is actively playing, purchase confirmed) AND you have no further actions to take:
+   → You MUST emit a special action: action: task_complete | reason: Goal achieved. Song is playing.
+   → This tells the system to terminate instantly instead of waiting to retry.
 
 🔹 LOADING/SPINNER: If the page shows a loading indicator, spinner, or "Please wait":
    → Use action: wait | value: 2000 | reason: Page is still loading
@@ -490,8 +512,11 @@ Before planning actions, first classify the current screen:
 🔹 ERROR/404 PAGE: If the page shows "Page not found", "Something went wrong", or similar errors:
    → Try navigating back or to the correct URL. If you can't determine the URL, ask the user.
 
-🔹 SEARCH RESULTS: If the page shows search results and you need to find a specific item:
-   → Click the most relevant result. If multiple candidates, use ask_user with disambiguation category.
+🔹 SEARCH RESULTS PAGE (CRITICAL — ALWAYS CHECK FOR DISAMBIGUATION FIRST):
+   If the page shows search results and you need to find a specific item:
+   → FIRST: Check if there are MULTIPLE items that could match the user's request.
+   → If YES → Use ask_user with disambiguation category and options from the page.
+   → If there's only ONE clear match → Click that result.
 
 CONFIDENCE GATE — CRITICAL RULES:
 1. ⛔ ONLY plan an action if you are CONFIDENT it moves toward the user's goal.
@@ -519,14 +544,18 @@ ACTION LINE RULES (strict):
 
 MULTI-STEP PATTERNS (you can output multiple actions per round):
 - SEARCH ON A SITE — CRITICAL RULES:
-  ★ If a text-input or search-input is ALREADY VISIBLE in the element list:
-    → DO NOT click it first. Go straight to: action: type | elementIdx: N | value: <query>\n
-    → Notice the \\n at the end of the value. This automatically presses Enter after typing to submit the search.
-    → This is the most reliable way to search. NEVER use a separate click on a search button if you can just append \\n to the type value.
-  ★ If ONLY a search ICON/BUTTON is visible (no text-input yet):
-    → Click the icon first. The text-input will appear in the next round.
-  ★ NEVER click a text-input/search-input element just to "focus" it — it wastes a round.
-    The first action on a search input must always be 'type', not 'click'.
+  1. NEVER click a text-input/search-input element just to "focus" it — it wastes a round.
+     The first action on a search input must ALWAYS be 'type', not 'click'.
+  2. If the user intent includes an explicit 'searchQuery' (e.g. they want to find/play a specific item):
+     → If ANY text-input or search-input is VISIBLE (even if its label is "What do you want to play?"): Go straight to: action: type | elementIdx: N | value: <query>
+  3. AUTOCOMPLETE / COMBOBOX DROPDOWNS (like Spotify or YouTube search):
+     → DO NOT append \\n to your type value.
+     → Type the text and WAIT for the next round. 
+     → In the next round, the autocomplete dropdown will appear. You MUST then click the correct suggestion from the dropdown instead of pressing Enter.
+  4. If NO autocomplete is expected (simple forms):
+     → Append \\n to the value (e.g. value: <query>\\n) to automatically press Enter.
+  5. CRITICAL: NEVER click a "Search" button/icon if a text-input element is already on the page! ONLY click a search icon if there are ZERO text-inputs visible.
+     If a text-input exists (e.g. labeled "What do you want to play?"), that IS the search box. Type into it directly.
 - Fill form + submit: type into fields → then click submit button. These CAN be in the same round, or you can just use \\n on the last field.
 - Navigate menus: click menu → next round shows dropdown → click item. One step per round.
 
@@ -632,6 +661,18 @@ PREFER asking the user over returning empty actions — an engaged agent is bett
             continue;
         }
 
+        // Handle explicit task completion signal.
+        // This allows the extension loop to terminate immediately when the goal is achieved.
+        if (a.action === 'task_complete') {
+            validated.push({
+                action: 'task_complete',
+                selector: '',
+                label: a.label || 'Task complete',
+                reason: a.reason || a.value || 'Goal achieved.',
+            });
+            continue;
+        }
+
         // Handle wait/scroll — no DOM element needed, value carries duration/direction
         if (a.action === 'wait' || a.action === 'scroll') {
             validated.push({
@@ -720,6 +761,67 @@ PREFER asking the user over returning empty actions — an engaged agent is bett
         if (fallbackClick) {
             console.log('[PageIntelligence] 0 actions validated — using fallback click for cookie/consent');
             return [fallbackClick];
+        }
+    }
+
+    // ─── Disambiguation Fallback ───────────────────────────────────────────────
+    // If the LLM clicked on a search result directly without asking the user,
+    // and there are MULTIPLE results matching the query, force ask_user instead.
+    // This handles music/video sites where "play X" returns multiple versions.
+    const searchQueryLower = (intent.searchQuery || originalQuery).toLowerCase();
+    const queryWords = searchQueryLower.split(/\s+/).filter(w => w.length > 2);
+    const isContinuationRound = executedActions && executedActions.length > 0;
+    
+    // Find all elements that could be search results matching the query
+    const matchingResults: Array<{ el: typeof activePage.interactiveElements[0]; score: number }> = [];
+    for (const el of activePage.interactiveElements) {
+        if (!['link', 'button', 'custom-option', 'image-button'].includes(el.type)) continue;
+        const label = (el.label || '').toLowerCase();
+        
+        // Score based on how many query words match
+        const matchCount = queryWords.filter(w => label.includes(w)).length;
+        if (matchCount >= Math.min(2, queryWords.length)) {
+            matchingResults.push({ el, score: matchCount });
+        }
+    }
+    
+    // Sort by score descending
+    matchingResults.sort((a, b) => b.score - a.score);
+    
+    // If there are 2+ high-scoring matches AND the LLM is about to click one of them,
+    // intercept with ask_user for disambiguation
+    const topMatches = matchingResults.slice(0, 5);
+    const hasDisambiguationAction = validated.some(a => a.action === 'ask_user' && a.category === 'disambiguation');
+    const aboutToClickResult = validated.some(a => 
+        a.action === 'click' && 
+        topMatches.some(m => m.el.idx === a.elementIdx)
+    );
+    
+    // Only trigger on FIRST round (before any actions executed) to avoid blocking
+    // when user has already made their choice
+    if (topMatches.length >= 2 && !hasDisambiguationAction && aboutToClickResult && !isContinuationRound) {
+        const options = topMatches
+            .map(m => m.el.label?.trim())
+            .filter(Boolean)
+            .slice(0, 5) as string[];
+        
+        if (options.length >= 2) {
+            console.log(`[PageIntelligence] 🎯 Disambiguation fallback triggered: ${topMatches.length} matches for "${searchQueryLower}"`);
+            console.log(`[DEBUG|PageIntelligence] Options: ${options.join(', ')}`);
+            // Remove any click actions on matching results — we'll ask instead
+            const filtered = validated.filter(a => 
+                !(a.action === 'click' && topMatches.some(m => m.el.idx === a.elementIdx))
+            );
+            filtered.unshift({
+                action: 'ask_user',
+                selector: '',
+                value: `I found ${options.length} results matching "${intent.searchQuery || originalQuery}". Which one do you want?`,
+                label: 'Choose result',
+                reason: 'Multiple search results match your query',
+                options,
+                category: 'disambiguation',
+            });
+            return filtered;
         }
     }
 

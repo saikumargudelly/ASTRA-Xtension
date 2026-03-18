@@ -151,24 +151,45 @@ export type BrowserAction =
 // These are forwarded to the content script and execute inside the page.
 export type DOMAction =
     | { type: 'click';          selector: string;  label?: string }
+    | { type: 'double_click';   selector: string;  retries?: number }
+    | { type: 'right_click';    selector: string }
     | { type: 'type';           selector: string;  value: string }
+    | { type: 'set_value';      selector: string;  value: string }
     | { type: 'hover';          selector: string }
+    | { type: 'highlight';      selector: string;  duration?: number }
     | { type: 'focus';          selector: string }
     | { type: 'clear';          selector: string }
     | { type: 'select_option';  selector: string;  value: string }
+    | { type: 'select-option';  selector: string;  value: string }
+    | { type: 'range_set';      selector: string;  value: string | number }
+    | { type: 'range-set';      selector: string;  value: string | number }
+    | { type: 'toggle_checkbox'; selector: string; checked?: boolean }
+    | { type: 'upload_file';    selector: string;  files: string[] }
     | { type: 'fill_form';      fields: Array<{ selector: string; value: string; label?: string }> }
-    | { type: 'scroll';         direction?: 'up' | 'down'; amount?: number; selector?: string }
+    | { type: 'scroll';         direction?: 'up' | 'down' | 'left' | 'right'; amount?: number; selector?: string }
     | { type: 'scroll_to';      selector: string }
-    | { type: 'drag_drop';      fromSelector: string; toSelector: string }
+    | { type: 'scroll_to_top';  selector?: string }
+    | { type: 'scroll_to_bottom'; selector?: string }
+    | { type: 'scroll_to_percent'; percent: number; selector?: string }
+    | { type: 'drag_drop';      fromSelector?: string; toSelector?: string; selector?: string; targetSelector?: string }
+    | { type: 'drag_and_drop';  selector: string; targetSelector: string }
+    | { type: 'multi_click';    selectors: string[]; amount?: number; retries?: number }
     | { type: 'wait_for';       selector: string;  timeout?: number }
     | { type: 'keyboard';       keys: string[] }
     | { type: 'extract_data';   selector: string;  attribute?: string }
-    | { type: 'search';         value: string }
+    | { type: 'get_attribute';  selector: string;  attribute: string }
+    | { type: 'search';         value: string; selector?: string }
     | { type: 'submit_form';    selector?: string }
-    | { type: 'wait';            duration?: number }
+    | { type: 'copy_text';      selector: string }
+    | { type: 'wait';           duration?: number; value?: string | number }
     | { type: 'read_page' }
     | { type: 'analyze_page' }
-    | { type: 'press_enter';    selector?: string };
+    | { type: 'task_complete';  reason?: string }
+    | { type: 'press_enter';    selector?: string }
+    | { type: 'dismiss_dialog'; value?: string }
+    | { type: 'assert_visible'; selector: string }
+    | { type: 'assert_text';    selector: string; expectedText: string }
+    | { type: 'iframe_action';  iframeSelector: string; innerAction: Record<string, unknown> };
 
 // ─── Planner Action (union returned by LLM /plan-actions route) ─────────────
 // Includes ask_user for conversational follow-ups when the agent needs user input
@@ -184,19 +205,57 @@ export type PlannerAction = ((BrowserAction | DOMAction | AskUserAction) & {
     label: string;
     elementIdx?: number;
     selector?: string;  // DOM actions only
-    value?: string;
+    value?: string | number;
 });
 
 // Background → Content Script
 export interface ExecuteDOMActionMessage {
     type: 'EXECUTE_DOM_ACTION';
     payload: {
-        action: 'click' | 'type' | 'scroll' | 'wait' | 'search' | 'press_enter' | 'focus' | 'clear' | 'select_option' | 'range-set';
+        action:
+            | 'click'
+            | 'double_click'
+            | 'right_click'
+            | 'hover'
+            | 'highlight'
+            | 'drag_drop'
+            | 'drag_and_drop'
+            | 'type'
+            | 'set_value'
+            | 'focus'
+            | 'clear'
+            | 'select_option'
+            | 'select-option'
+            | 'range_set'
+            | 'range-set'
+            | 'toggle_checkbox'
+            | 'upload_file'
+            | 'search'
+            | 'submit_form'
+            | 'copy_text'
+            | 'scroll'
+            | 'scroll_to'
+            | 'scroll_to_percent'
+            | 'wait'
+            | 'press_enter'
+            | 'dismiss_dialog'
+            | 'assert_visible'
+            | 'assert_text'
+            | 'iframe_action';
         selector?: string;
-        value?: string;
+        value?: string | number;
         duration?: number;
-        direction?: 'up' | 'down';
+        direction?: 'up' | 'down' | 'left' | 'right';
         amount?: number;
+        targetSelector?: string;
+        checked?: boolean;
+        files?: string[];
+        response?: string;
+        expectedText?: string;
+        iframeSelector?: string;
+        innerAction?: Record<string, unknown>;
+        percent?: number;
+        attribute?: string;
     };
 }
 

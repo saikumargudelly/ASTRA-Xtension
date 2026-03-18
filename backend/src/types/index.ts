@@ -114,6 +114,7 @@ export type BrowserAction =
     | { type: 'wait'; duration: number }
     | { type: 'read_page'; selector?: string; maxDepth?: number }
     | { type: 'analyze_page'; maxScrolls?: number; scrollDelay?: number }
+    | { type: 'task_complete'; reason?: string }
     | { type: 'search'; value: string };
 
 // Analyze endpoint

@@ -37,7 +37,7 @@ const SELECTOR_INJECTION_PATTERNS = [
     /expression\s*\(/i,    // CSS expression()
     /import\s*\(/i,
     /url\s*\(\s*["']?javascript/i,
-    /\\[0-9a-fA-F]/,       // excessive unicode escapes used to bypass
+    /\\[0-9a-fA-F]{5,}/,   // excessive unicode escapes used to bypass (allow short CSS.escape sequences like \20)
     /\.\.\//,              // path traversal
 ];
 
@@ -54,12 +54,16 @@ const ALLOWED_BROWSER_ACTIONS = new Set<string>([
 ]);
 
 const ALLOWED_DOM_ACTIONS = new Set<string>([
-    'click', 'type', 'hover', 'focus', 'clear', 'select_option',
-    'fill_form', 'scroll', 'scroll_to', 'drag_drop', 'wait_for',
-    'keyboard', 'extract_data', 'search', 'submit_form',
-    'read_page', 'analyze_page',
+    'click', 'double_click', 'right_click', 'hover', 'highlight',
+    'type', 'set_value', 'focus', 'clear', 'select_option',
+    'fill_form', 'toggle_checkbox', 'upload_file',
+    'scroll', 'scroll_to', 'scroll_to_top', 'scroll_to_bottom', 'scroll_to_percent',
+    'drag_drop', 'drag_and_drop', 'multi_click', 'wait_for',
+    'keyboard', 'extract_data', 'get_attribute', 'search', 'submit_form', 'copy_text',
+    'dismiss_dialog', 'assert_visible', 'assert_text', 'iframe_action',
+    'read_page', 'analyze_page', 'task_complete',
     // legacy aliases
-    'range-set', 'select-option', 'wait',
+    'range-set', 'range_set', 'select-option', 'wait', 'press_enter',
 ]);
 
 // ─── Keyboard Key Allowlist ───────────────────────────────────────────────────
@@ -79,7 +83,7 @@ const ALLOWED_KEYS = new Set([
 // ─── Rate Limiting ────────────────────────────────────────────────────────────
 interface RateWindow { count: number; windowStart: number }
 const RATE_MAP = new Map<string, RateWindow>();
-const RATE_LIMIT = 30;        // max actions per window
+const RATE_LIMIT = 80;        // max actions per window (supports long multi-step sessions)
 const RATE_WINDOW_MS = 60_000; // 60 s rolling window
 
 function checkRateLimit(sessionId: string): boolean {
@@ -286,6 +290,45 @@ export function validateAction(
         }
     }
 
+    // Validate secondary selectors used by enhanced actions.
+    if ('targetSelector' in action && typeof (action as { targetSelector?: string }).targetSelector === 'string') {
+        try {
+            sanitizeSelector((action as { targetSelector: string }).targetSelector);
+        } catch (err) {
+            const reason = (err as Error).message;
+            log(sessionId, type, action.label ?? '', false, (action as { targetSelector: string }).targetSelector, true, reason);
+            return { allowed: false, reason };
+        }
+    }
+
+    if ('iframeSelector' in action && typeof (action as { iframeSelector?: string }).iframeSelector === 'string') {
+        try {
+            sanitizeSelector((action as { iframeSelector: string }).iframeSelector);
+        } catch (err) {
+            const reason = (err as Error).message;
+            log(sessionId, type, action.label ?? '', false, (action as { iframeSelector: string }).iframeSelector, true, reason);
+            return { allowed: false, reason };
+        }
+    }
+
+    if (type === 'multi_click' && 'selectors' in action) {
+        const selectors = (action as { selectors?: string[] }).selectors;
+        if (!Array.isArray(selectors) || selectors.length === 0 || selectors.length > 50) {
+            const reason = 'multi_click requires selectors[] with 1-50 items';
+            log(sessionId, type, action.label ?? '', false, undefined, true, reason);
+            return { allowed: false, reason };
+        }
+        for (const selector of selectors) {
+            try {
+                sanitizeSelector(selector);
+            } catch (err) {
+                const reason = (err as Error).message;
+                log(sessionId, type, action.label ?? '', false, selector, true, reason);
+                return { allowed: false, reason };
+            }
+        }
+    }
+
     // fill_form — validate all field selectors and values
     if (type === 'fill_form' && 'fields' in action) {
         const fields = (action as { fields: Array<{ selector: string; value: string }> }).fields;
@@ -298,6 +341,48 @@ export function validateAction(
                 log(sessionId, type, action.label ?? '', false, f.selector, true, reason);
                 return { allowed: false, reason };
             }
+        }
+    }
+
+    // upload_file — validate files payload shape and cap count.
+    if (type === 'upload_file' && 'files' in action) {
+        const files = (action as { files?: string[] }).files;
+        if (!Array.isArray(files) || files.length === 0 || files.length > 20) {
+            const reason = 'upload_file requires files[] with 1-20 entries';
+            log(sessionId, type, action.label ?? '', false, undefined, true, reason);
+            return { allowed: false, reason };
+        }
+        for (const file of files) {
+            if (typeof file !== 'string' || file.trim().length === 0 || file.length > 1024) {
+                const reason = 'upload_file contains an invalid file entry';
+                log(sessionId, type, action.label ?? '', false, undefined, true, reason);
+                return { allowed: false, reason };
+            }
+        }
+    }
+
+    // assert_text — cap expected text length to avoid huge payloads.
+    if (type === 'assert_text' && 'expectedText' in action) {
+        const expectedText = (action as { expectedText?: string }).expectedText;
+        if (typeof expectedText !== 'string' || expectedText.trim().length === 0) {
+            const reason = 'assert_text requires a non-empty expectedText';
+            log(sessionId, type, action.label ?? '', false, undefined, true, reason);
+            return { allowed: false, reason };
+        }
+        if (expectedText.length > 1024) {
+            const reason = 'assert_text expectedText exceeds 1024 characters';
+            log(sessionId, type, action.label ?? '', false, undefined, true, reason);
+            return { allowed: false, reason };
+        }
+    }
+
+    // scroll_to_percent — ensure range is safe.
+    if (type === 'scroll_to_percent' && 'percent' in action) {
+        const percent = Number((action as { percent?: number }).percent);
+        if (!Number.isFinite(percent) || percent < 0 || percent > 100) {
+            const reason = 'scroll_to_percent requires percent in range [0, 100]';
+            log(sessionId, type, action.label ?? '', false, undefined, true, reason);
+            return { allowed: false, reason };
         }
     }
 

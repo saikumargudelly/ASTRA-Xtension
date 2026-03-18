@@ -20,9 +20,9 @@ export type { Skill, SkillResult, SkillExecutor, BrowserContext } from './regist
 
 import { skillRegistry } from './registry.js';
 import { buildBrowserSkills } from './browser-skills.js';
-import { buildDOMSkills } from './dom-skills.js';
+import { buildDOMSkills } from './dom-skills';
 import type { BrowserSkillDeps } from './browser-skills.js';
-import type { DOMSkillDeps } from './dom-skills.js';
+import type { DOMSkillDeps } from './dom-skills';
 
 export type AllSkillDeps = BrowserSkillDeps & DOMSkillDeps;
 

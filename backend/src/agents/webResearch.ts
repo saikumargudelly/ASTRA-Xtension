@@ -55,12 +55,17 @@ export async function performWebResearch(
 
         // Fetch up to 2 readable URLs that aren't PDFs/videos
         let fetched = 0;
+        const fetchStartTime = Date.now();
         for (const res of results) {
             if (fetched >= 2) break;
             if (res.url.endsWith('.pdf') || res.url.includes('youtube.com')) continue;
 
+            const fetchStart = Date.now();
             try {
                 const text = await fetchPageContent(res.url, { timeout: 4000, maxContentLength: 15000 });
+                const fetchDuration = Date.now() - fetchStart;
+                const logEntry = JSON.stringify({location:'webResearch.ts', timestamp: new Date().toISOString(), event: 'fetch_page', url: res.url.substring(0, 80), duration_ms: fetchDuration, success: !!text});
+                console.log(`[PERF] ${logEntry}`);
                 if (text && text.length > 200) {
                     combinedText += `\n--- Source: ${res.url} ---\n${text.slice(0, 3000)}\n`;
                     sources.push(res.url);

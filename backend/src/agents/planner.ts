@@ -37,6 +37,8 @@ RULES:
    - You have NEVER seen the target page. You CANNOT know what buttons/links exist.
    - Any click/search/type steps you add will be WRONG and will BREAK the execution.
    - Even if the user says "play X" or "search for Y", do NOT add those steps. The live loop handles it.
+9. If the CURRENT URL already matches the target site, skip open_tab and start from the snapshot loop:
+   emit a single analyze_page step so the loop can type/click directly.
 
 Output ONLY this TOON block (no extra text, no markdown):
 intent: ...
