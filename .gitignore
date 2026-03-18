@@ -17,3 +17,10 @@ ROOT-CAUSE-ANALYSIS-FIX.md
 SYSTEM-ENHANCEMENTS-COMPLETE.md
 plans/
 .code-cli/
+
+# Test & debug files
+test-*.js
+test-*.html
+*.test.js
+*.spec.js
+
