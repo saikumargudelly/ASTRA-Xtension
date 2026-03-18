@@ -50,6 +50,96 @@ function safeQuerySelectorAll(selector: string): Element[] {
     }
 }
 
+// ─── Deep selector search (includes Shadow DOM) ───
+function deepQuerySelector(selector: string, root: Document | ShadowRoot | Element = document): Element | null {
+    if (!selector || typeof selector !== 'string') return null;
+    if (SELECTOR_INJECTION_RE.test(selector)) return null;
+    
+    try {
+        // First try regular querySelector (light DOM)
+        const el = (root as Document | Element).querySelector?.(selector);
+        if (el) return el;
+    } catch {
+        // selector syntax error - continue to deep search
+    }
+
+    // Deep search through shadow DOM
+    const walker = (node: Element | Document): Element | null => {
+        try {
+            const matches = node.querySelectorAll?.(selector);
+            if (matches?.length) return matches[0];
+        } catch {
+            // Continue deep search
+        }
+
+        const children = (node instanceof Document ? node.documentElement?.childNodes : node.childNodes) || [];
+        for (const child of Array.from(children)) {
+            if (!(child instanceof Element)) continue;
+            const found = walker(child);
+            if (found) return found;
+            if (child.shadowRoot) {
+                const foundInShadow = walker(child.shadowRoot as any);
+                if (foundInShadow) return foundInShadow;
+            }
+        }
+        return null;
+    };
+
+    return walker(root instanceof Document ? root.documentElement! : root);
+}
+
+function deepQuerySelectorAll(selector: string, root: Document | ShadowRoot | Element = document): Element[] {
+    if (!selector || typeof selector !== 'string') return [];
+    if (SELECTOR_INJECTION_RE.test(selector)) return [];
+    
+    const results: Element[] = [];
+    const seen = new Set<Element>();
+
+    try {
+        // First try regular querySelectorAll (light DOM)
+        const els = root.querySelectorAll?.(selector);
+        if (els) {
+            for (const el of els) {
+                if (!seen.has(el)) {
+                    results.push(el);
+                    seen.add(el);
+                }
+            }
+        }
+    } catch {
+        // Continue to deep search
+    }
+
+    // Deep search through shadow DOM
+    const walker = (node: Element | Document): void => {
+        try {
+            const matches = node.querySelectorAll?.(selector);
+            if (matches) {
+                for (const el of matches) {
+                    if (!seen.has(el)) {
+                        results.push(el);
+                        seen.add(el);
+                    }
+                }
+            }
+        } catch {
+            // Continue deep search
+        }
+
+        const children = (node instanceof Document ? node.documentElement?.childNodes : node.childNodes) || [];
+        for (const child of Array.from(children)) {
+            if (!(child instanceof Element)) continue;
+            walker(child);
+            if (child.shadowRoot) {
+                walker(child.shadowRoot as any);
+            }
+        }
+    };
+
+    walker(root instanceof Document ? root.documentElement! : root);
+    return results;
+}
+
 function safeValue(val: string): string {
     if (typeof val !== 'string') return '';
     // Guard against javascript: protocol in input values
@@ -114,6 +204,7 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     // ─── CLICK_ELEMENT: Click a specific element by selector with cursor animation ───
     if (message.type === 'CLICK_ELEMENT') {
         const { selector, label } = message.payload || {};
+        
         const attemptClick = (el: HTMLElement) => {
             (async () => {
                 await cursorFocusElement(el, label || 'Clicking...');
@@ -137,39 +228,53 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
                 await sleep(300);
                 hideCursorFeedback();
                 setTimeout(() => removeAstraCursor(), 800);
-                sendResponse({ success: true });
+                sendResponse({ success: true, data: { selector, label, usedDeepSearch: false } });
             })();
         };
 
-        let el = safeQuerySelector(selector) as HTMLElement;
-        
-        // Smart retry: if element not found, wait briefly (SPA rendering delay)
-        if (!el) {
-            setTimeout(() => {
-                el = safeQuerySelector(selector) as HTMLElement;
-                // Last resort: try broader selector (strip nth-of-type, etc.)
-                if (!el && selector.includes(':nth-of-type')) {
-                    const simplified = selector.replace(/:nth-of-type\(\d+\)/, '');
-                    el = safeQuerySelector(simplified) as HTMLElement;
-                }
-                if (!el) {
-                    sendResponse({ success: false, error: `Element not found: ${selector}` });
-                    return;
-                }
-                attemptClick(el);
-            }, 500);
-            return true;
-        }
-        // Last resort: try broader selector (strip nth-of-type, etc.)
-        if (!el && selector.includes(':nth-of-type')) {
-            const simplified = selector.replace(/:nth-of-type\(\d+\)/, '');
-            el = safeQuerySelector(simplified) as HTMLElement;
-        }
+        // Try regular querySelector first (faster path for light DOM)
+        let el = safeQuerySelector(selector) as HTMLElement | null;
         
         if (!el) {
-            sendResponse({ success: false, error: `Element not found: ${selector}` });
+            // Try simplified selector (strip nth-of-type, etc.)
+            if (selector.includes(':nth-of-type')) {
+                const simplified = selector.replace(/:nth-of-type\(\d+\)/g, '');
+                el = safeQuerySelector(simplified) as HTMLElement | null;
+            }
+        }
+
+        if (!el) {
+            // Try deep search (includes shadow DOM) with retry
+            const retryDeepSearch = () => {
+                setTimeout(() => {
+                    el = deepQuerySelector(selector) as HTMLElement | null;
+                    if (!el) {
+                        // Try simplified version in shadow DOM
+                        if (selector.includes(':nth-of-type')) {
+                            const simplified = selector.replace(/:nth-of-type\(\d+\)/g, '');
+                            el = deepQuerySelector(simplified) as HTMLElement | null;
+                        }
+                    }
+                    
+                    if (!el) {
+                        console.error('[ASTRA|CLICK] Element not found after deep search:', selector);
+                        sendResponse({ 
+                            success: false, 
+                            error: `Element not found: ${selector}. Page may need scrolling or has async elements.`,
+                            code: 'ELEMENT_NOT_FOUND'
+                        });
+                        return;
+                    }
+                    
+                    console.log('[ASTRA|CLICK] Found element via deep search (shadow DOM):', selector);
+                    attemptClick(el as HTMLElement);
+                }, 500);
+            };
+
+            retryDeepSearch();
             return true;
         }
+
         attemptClick(el);
         return true;
     }
@@ -761,13 +866,20 @@ function getPageSnapshot(): {
     });
 
     // 7. Text/search inputs (used for forms, search bars, etc.) ────────────
-    document.querySelectorAll('input[type="text"], input[type="email"], input[type="url"], input[type="tel"], input[type="password"], input:not([type]), textarea, [contenteditable="true"]').forEach(el => {
+    document.querySelectorAll('input[type="search"], input[type="text"], input[type="email"], input[type="url"], input[type="tel"], input[type="password"], input:not([type]), textarea, [contenteditable="true"]').forEach(el => {
         const inp = el as HTMLInputElement;
         // Skip hidden/number/range (already captured above)
-        if (inp.type === 'hidden' || inp.type === 'number' || inp.type === 'range') return;
+        if (inp instanceof HTMLInputElement && (inp.type === 'hidden' || inp.type === 'number' || inp.type === 'range')) return;
         const labelEl = inp.labels?.[0] || inp.closest('label');
         const label = (inp.getAttribute('aria-label') || inp.getAttribute('placeholder') || labelEl?.textContent || inp.name || 'Text input').trim();
-        push(inp, 'text-input', label, { value: inp.value || undefined });
+        const aria = (inp.getAttribute('aria-label') || '').toLowerCase();
+        const placeholder = (inp.getAttribute('placeholder') || '').toLowerCase();
+        const isSearchInput = inp instanceof HTMLInputElement
+            && (inp.type === 'search' || aria.includes('search') || placeholder.includes('search') || placeholder.includes('what do you want to play'));
+        const currentValue = (inp instanceof HTMLInputElement || inp instanceof HTMLTextAreaElement)
+            ? inp.value
+            : ((el as HTMLElement).innerText || '').trim();
+        push(inp, isSearchInput ? 'search-input' : 'text-input', label, { value: currentValue || undefined });
     });
 
     // 8. Custom React-style dropdowns / role=listbox ───────────────────────
@@ -2457,7 +2569,22 @@ async function handleDOMAction(message: ExecuteDOMActionMessage) {
         percent,
     } = message.payload;
 
-    const findElement = (sel: string): HTMLElement | null => safeQuerySelector(sel) as HTMLElement | null;
+    const findElement = (sel: string): HTMLElement | null => {
+        let el = safeQuerySelector(sel) as HTMLElement | null;
+        if (!el) {
+            // Try simplified selector (strip nth-of-type, etc.)
+            if (sel.includes(':nth-of-type')) {
+                const simplified = sel.replace(/:nth-of-type\(\d+\)/g, '');
+                el = safeQuerySelector(simplified) as HTMLElement | null;
+            }
+        }
+        if (!el) {
+            // Try deep search (includes shadow DOM)
+            el = deepQuerySelector(sel) as HTMLElement | null;
+        }
+        return el;
+    };
+
     const ensureElement = (sel: string): HTMLElement => {
         const el = findElement(sel);
         if (!el) throw new Error(`Element not found: ${sel}`);
@@ -2483,11 +2610,11 @@ async function handleDOMAction(message: ExecuteDOMActionMessage) {
     switch (action) {
         case 'click': {
             if (!selector) throw new Error('click requires a selector');
-            let el = safeQuerySelector(selector) as HTMLElement | null;
+            let el = findElement(selector);
             // Retry with a brief wait for SPAs that render lazily
             if (!el) {
                 await sleep(500);
-                el = safeQuerySelector(selector) as HTMLElement | null;
+                el = findElement(selector);
             }
             if (!el) throw new Error(`Element not found: ${selector}. The page may have changed — re-snapshot needed.`);
             // Ensure visible — scroll into view if needed
@@ -2634,59 +2761,120 @@ async function handleDOMAction(message: ExecuteDOMActionMessage) {
             if (!selector) throw new Error('type requires a selector');
             if (value === undefined || value === null) throw new Error('type requires a value');
             const textValue = String(value);
-            const el = safeQuerySelector(selector) as HTMLInputElement | HTMLTextAreaElement | null;
-            if (!el) throw new Error(`Element not found: ${selector}`);
-            
+
+            const isTypeableInput = (node: Element | null): node is HTMLInputElement | HTMLTextAreaElement => {
+                if (!node) return false;
+                if (node instanceof HTMLTextAreaElement) return true;
+                if (node instanceof HTMLInputElement) {
+                    const t = (node.type || 'text').toLowerCase();
+                    return !['hidden', 'button', 'submit', 'reset', 'checkbox', 'radio', 'range', 'color', 'file', 'image'].includes(t);
+                }
+                return false;
+            };
+
+            const findFallbackInput = (): HTMLInputElement | HTMLTextAreaElement | null => {
+                const active = document.activeElement as Element | null;
+                if (isTypeableInput(active) && isVisible(active as HTMLElement)) return active;
+
+                const deepSearch = findSearchInputDeep();
+                if (isTypeableInput(deepSearch) && isVisible(deepSearch as HTMLElement)) return deepSearch;
+
+                const fallbackSelectors = [
+                    'input[type="search"]',
+                    'input[placeholder*="search" i]',
+                    'input[placeholder*="what do you want to play" i]',
+                    'input[aria-label*="search" i]',
+                    'input[name*="search" i]',
+                    '[role="search"] input',
+                    'textarea',
+                ];
+
+                for (const sel of fallbackSelectors) {
+                    const candidate = safeQuerySelector(sel) || deepQuerySelector(sel);
+                    if (isTypeableInput(candidate) && isVisible(candidate as HTMLElement)) return candidate;
+                }
+
+                const visibleInputs = Array.from(document.querySelectorAll('input, textarea'));
+                for (const candidate of visibleInputs) {
+                    if (isTypeableInput(candidate) && isVisible(candidate as HTMLElement)) return candidate;
+                }
+
+                return null;
+            };
+
+            let requestedEl = safeQuerySelector(selector) as Element | null;
+            if (!requestedEl) {
+                // Try simplified selector (strip nth-of-type, etc.)
+                if (selector.includes(':nth-of-type')) {
+                    const simplified = selector.replace(/:nth-of-type\(\d+\)/g, '');
+                    requestedEl = safeQuerySelector(simplified);
+                }
+            }
+            if (!requestedEl) {
+                // Try deep search (includes shadow DOM)
+                requestedEl = deepQuerySelector(selector);
+                if (requestedEl) console.log('[ASTRA|TYPE] Found element via deep search (shadow DOM):', selector);
+            }
+
+            let usedFallback = false;
+            let el = isTypeableInput(requestedEl) ? requestedEl : null;
+            if (!el) {
+                el = findFallbackInput();
+                usedFallback = true;
+            }
+
+            if (!el) {
+                return {
+                    success: false,
+                    error: `Cannot type: selector "${selector}" is not a text input and no fallback input was found.`,
+                    code: 'NO_TEXT_INPUT',
+                };
+            }
+
+            const resolvedSelector = generateSmartSelector(el);
+
             // ─── Visual cursor feedback ───
             await cursorFocusElement(el, `Typing "${textValue.substring(0, 20)}${textValue.length > 20 ? '...' : ''}"`);
-            
+
             el.focus();
-            
+            el.click();
+
             // Clear existing value robustly (React-friendly)
             const nativeInputValueSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')?.set;
             const nativeTextAreaValueSetter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value')?.set;
-            const setter = el instanceof HTMLTextAreaElement ? nativeTextAreaValueSetter : 
-                           (el instanceof HTMLInputElement ? nativeInputValueSetter : undefined);
-            
-            if (setter) {
-                setter.call(el, '');
-            } else if ('value' in el) {
-                (el as any).value = '';
-            } else {
-                return { success: false, error: `Cannot type into ${(el as Element).tagName}: not a valid input element. You must find the actual text-input element.` };
-            }
+            const setter = el instanceof HTMLTextAreaElement ? nativeTextAreaValueSetter : nativeInputValueSetter;
+
+            if (setter) setter.call(el, '');
+            else el.value = '';
             el.dispatchEvent(new Event('input', { bubbles: true, composed: true }));
             el.dispatchEvent(new Event('change', { bubbles: true, composed: true }));
-            
+
             // Type the new value character by character with full KeyboardEvent lifecycle
             let currentVal = '';
             const isSubmit = textValue.endsWith('\n') || textValue.endsWith('\\n') || textValue.endsWith('\\\\n');
             const typeValue = textValue.replace(/\\{1,2}n$/, '').replace(/\n$/, '');
-            
+
             for (const char of typeValue) {
                 currentVal += char;
-                
+
                 // Keydown
                 const keyOpts = { key: char, code: `Key${char.toUpperCase()}`, bubbles: true, cancelable: true, composed: true };
                 el.dispatchEvent(new KeyboardEvent('keydown', keyOpts));
                 el.dispatchEvent(new KeyboardEvent('keypress', keyOpts));
-                
+
                 // Set value
-                if (setter) {
-                    setter.call(el, currentVal);
-                } else if ('value' in el) {
-                    (el as any).value = currentVal;
-                }
-                
+                if (setter) setter.call(el, currentVal);
+                else el.value = currentVal;
+
                 // Input & Keyup
                 el.dispatchEvent(new Event('input', { bubbles: true, composed: true }));
                 el.dispatchEvent(new KeyboardEvent('keyup', keyOpts));
-                
+
                 await sleep(30); // Slower typing for visibility (30ms per char)
             }
-            
+
             el.dispatchEvent(new Event('change', { bubbles: true, composed: true }));
-            
+
             // Auto-submit if value ends with a newline (just like browser-use does)
             if (isSubmit) {
                 await sleep(100);
@@ -2699,9 +2887,17 @@ async function handleDOMAction(message: ExecuteDOMActionMessage) {
                     el.form.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true, composed: true }));
                 }
             }
-            
+
             hideCursorFeedback();
-            return { success: true, data: { typed: typeValue, into: selector } };
+            return {
+                success: true,
+                data: {
+                    typed: typeValue,
+                    into: resolvedSelector,
+                    requestedSelector: selector,
+                    usedFallback: resolvedSelector !== selector,
+                },
+            };
         }
 
         case 'set_value': {
@@ -3303,6 +3499,7 @@ function extractElements(
 
     const results: DOMElement[] = [];
 
+    // Process light DOM children
     for (const child of Array.from(el.children)) {
         const htmlChild = child as HTMLElement;
         const tag = htmlChild.tagName.toLowerCase();
@@ -3368,12 +3565,109 @@ function extractElements(
             if (placeholder) element.attributes.placeholder = placeholder;
         }
 
-        if (htmlChild.children.length > 0) {
-            const children = extractElements(htmlChild, maxDepth, includeText, depth + 1);
+        if (htmlChild.children.length > 0 || htmlChild.shadowRoot?.childElementCount) {
+            let children: DOMElement[] = [];
+            
+            // Extract from light DOM children
+            if (htmlChild.children.length > 0) {
+                children = extractElements(htmlChild, maxDepth, includeText, depth + 1);
+            }
+            
+            // Also extract from shadow DOM if present
+            if (htmlChild.shadowRoot && depth + 1 < maxDepth) {
+                const shadowRoot = htmlChild.shadowRoot as any as HTMLElement;
+                const shadowChildren = extractElements(shadowRoot, maxDepth, includeText, depth + 1);
+                children = [...children, ...shadowChildren];
+            }
+            
             if (children.length > 0) element.children = children;
         }
 
         results.push(element);
+    }
+
+    // Also process shadow DOM children at this level
+    if ((el as any).shadowRoot && depth > 0) {
+        const shadowEl = (el as any).shadowRoot as HTMLElement;
+        for (const child of Array.from(shadowEl.children)) {
+            const htmlChild = child as HTMLElement;
+            const tag = htmlChild.tagName.toLowerCase();
+
+            if (['script', 'style', 'noscript', 'svg', 'path'].includes(tag)) continue;
+
+            const className = (htmlChild.className?.toString() || '').toLowerCase();
+            const id = (htmlChild.id?.toString() || '').toLowerCase();
+            if (className.includes('resizer') || className.includes('splitter') ||
+                className.includes('divider') || className.includes('layout-handle') ||
+                id.includes('resizer') || id.includes('splitter') || id.includes('divider')) {
+                continue;
+            }
+
+            const element: DOMElement = { tag };
+
+            if (htmlChild.id) element.id = htmlChild.id;
+            if (htmlChild.className && typeof htmlChild.className === 'string') {
+                element.className = htmlChild.className.trim().substring(0, 100);
+            }
+
+            const href = htmlChild.getAttribute('href');
+            if (href) element.href = href;
+
+            const inputValue = (htmlChild as HTMLInputElement).value;
+            if (inputValue) element.value = inputValue;
+
+            const rect = htmlChild.getBoundingClientRect();
+            if (rect.width > 0 && rect.height > 0) {
+                element.rect = {
+                    top: Math.round(rect.top),
+                    left: Math.round(rect.left),
+                    width: Math.round(rect.width),
+                    height: Math.round(rect.height),
+                };
+            }
+
+            if (includeText) {
+                const directText = Array.from(htmlChild.childNodes)
+                    .filter((n) => n.nodeType === Node.TEXT_NODE)
+                    .map((n) => n.textContent?.trim())
+                    .filter(Boolean)
+                    .join(' ')
+                    .substring(0, 200);
+                if (directText) element.text = directText;
+            }
+
+            const role = htmlChild.getAttribute('role');
+            const ariaLabel = htmlChild.getAttribute('aria-label');
+            const dataTestId = htmlChild.getAttribute('data-testid');
+            const type = htmlChild.getAttribute('type');
+            const name = htmlChild.getAttribute('name');
+            const placeholder = htmlChild.getAttribute('placeholder');
+
+            if (role || ariaLabel || dataTestId || type || name || placeholder) {
+                element.attributes = {};
+                if (role) element.attributes.role = role;
+                if (ariaLabel) element.attributes['aria-label'] = ariaLabel;
+                if (dataTestId) element.attributes['data-testid'] = dataTestId;
+                if (type) element.attributes.type = type;
+                if (name) element.attributes.name = name;
+                if (placeholder) element.attributes.placeholder = placeholder;
+            }
+
+            if (htmlChild.children.length > 0 || htmlChild.shadowRoot?.childElementCount) {
+                let children: DOMElement[] = [];
+                if (htmlChild.children.length > 0) {
+                    children = extractElements(htmlChild, maxDepth, includeText, depth + 1);
+                }
+                if (htmlChild.shadowRoot && depth + 1 < maxDepth) {
+                    const shadowRoot = htmlChild.shadowRoot as any as HTMLElement;
+                    const shadowChildren = extractElements(shadowRoot, maxDepth, includeText, depth + 1);
+                    children = [...children, ...shadowChildren];
+                }
+                if (children.length > 0) element.children = children;
+            }
+
+            results.push(element);
+        }
     }
 
     return results;

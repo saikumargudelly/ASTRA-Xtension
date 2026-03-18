@@ -220,6 +220,44 @@ function applyField(entry: Partial<PlannedAction>, key: string, value: string) {
     else if (key === 'category') entry.category = value as PlannedAction['category'];
 }
 
+function isTextEntryElementType(type?: string): boolean {
+    const t = (type || '').toLowerCase();
+    return t === 'text-input' || t === 'search-input' || t === 'number-input';
+}
+
+function findBestTextInputElement(elements: InteractiveElement[], query?: string): InteractiveElement | undefined {
+    const candidates = elements.filter((el) => isTextEntryElementType(el.type));
+    if (candidates.length === 0) return undefined;
+
+    const words = (query || '')
+        .toLowerCase()
+        .split(/\s+/)
+        .filter((w) => w.length > 2)
+        .slice(0, 5);
+
+    const scored = candidates.map((el) => {
+        const hay = `${el.label || ''} ${el.selector || ''} ${el.context || ''}`.toLowerCase();
+        let score = 0;
+
+        const hasLayoutFlag = /(resizer|splitter|divider|layout)/i.test(hay) && !/(search|query|find)/i.test(hay);
+        if (hasLayoutFlag) score -= 220;
+
+        if (el.type === 'search-input') score += 80;
+        if (el.type === 'text-input') score += 20;
+        if (/(search|query|find|what do you want to play|play)/i.test(hay)) score += 45;
+
+        for (const w of words) {
+            if (hay.includes(w)) score += 8;
+        }
+
+        return { el, score };
+    }).sort((a, b) => b.score - a.score);
+
+    const best = scored[0];
+    if (!best || best.score < 0) return undefined;
+    return best.el;
+}
+
 // ─── Phase 2: Plan Actions from Intent + Snapshot ────────────────────────────
 
 export async function planPageActions(
@@ -736,6 +774,40 @@ PREFER asking the user over returning empty actions — an engaged agent is bett
             console.warn(`[PageIntelligence] ⚠ elementIdx ${a.elementIdx} not in snapshot — rejected`);
             continue;
         }
+
+        // Guard rail: never type into non-text elements (e.g., search icon button).
+        // Auto-correct to the best text input when possible.
+        if (a.action === 'type') {
+            const elText = `${el.label || ''} ${el.selector || ''} ${el.context || ''}`.toLowerCase();
+            const looksLikeLayoutControl = /(resizer|splitter|divider|layout)/i.test(elText) && !/(search|query|find)/i.test(elText);
+            const isTypeTarget = isTextEntryElementType(el.type);
+
+            if (!isTypeTarget || looksLikeLayoutControl) {
+                const fallbackTarget = findBestTextInputElement(
+                    activePage.interactiveElements,
+                    a.value || intent.searchQuery || originalQuery,
+                );
+
+                if (fallbackTarget && fallbackTarget.idx !== el.idx) {
+                    console.warn(
+                        `[PageIntelligence] Auto-corrected type target: idx ${el.idx} (${el.type}:${el.label}) -> idx ${fallbackTarget.idx} (${fallbackTarget.type}:${fallbackTarget.label})`,
+                    );
+                    validated.push({
+                        action: 'type',
+                        selector: fallbackTarget.selector,
+                        elementIdx: fallbackTarget.idx,
+                        value: a.value,
+                        label: fallbackTarget.label,
+                        reason: `${a.reason || ''}${a.reason ? ' | ' : ''}Auto-corrected to visible text input`,
+                    });
+                    continue;
+                }
+
+                console.warn(`[PageIntelligence] ⚠ Rejecting type action on non-text elementIdx ${el.idx} (${el.type}:${el.label})`);
+                continue;
+            }
+        }
+
         validated.push({
             action: a.action as PlannedAction['action'],
             selector: el.selector,  // always ground-truth, never LLM's selector string
