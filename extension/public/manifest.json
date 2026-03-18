@@ -34,8 +34,6 @@
         "tabs",
         "scripting",
         "storage",
-        "bookmarks",
-        "downloads",
         "webRequest",
         "sidePanel"
     ],

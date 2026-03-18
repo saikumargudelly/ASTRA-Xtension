@@ -140,13 +140,13 @@ ${output.substring(0, 3000)}`;
         };
     } catch (err) {
         console.warn('[Critic] Evaluation failed:', (err as Error).message);
-        // Return a passing score on failure to avoid blocking the pipeline
+        // Do NOT silently approve on failure — surface the problem so the caller can decide.
         return {
-            quality: 0.8, accuracy: 0.8, completeness: 0.8, safety: 1.0,
-            overall: 0.85,
-            issues: [],
-            suggestions: [],
-            approved: true,
+            quality: 0, accuracy: 0, completeness: 0, safety: 1.0,
+            overall: 0,
+            issues: [`Critic evaluation unavailable: ${(err as Error).message}`],
+            suggestions: ['Retry the evaluation or proceed with manual review.'],
+            approved: false,
         };
     }
 }

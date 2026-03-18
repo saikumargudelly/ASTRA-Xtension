@@ -190,8 +190,10 @@ export async function evaluateGoal(
         return result;
 
     } catch (err) {
-        // Non-fatal — default to in_progress so the loop continues
-        console.warn('[GoalEvaluator] LLM call failed, defaulting to in_progress:', (err as Error).message);
-        return { status: 'in_progress', confidence: 0.5, reason: 'Evaluation failed — continuing' };
+        // FIX 11: Do NOT default to 'in_progress' on evaluator failure.
+        // 'in_progress' would make the loop continue blindly when the evaluator is rate-limited.
+        // Return 'stuck' with zero confidence so the caller can decide whether to abort.
+        console.warn('[GoalEvaluator] LLM call failed, returning stuck/unknown:', (err as Error).message);
+        return { status: 'stuck' as GoalStatus, confidence: 0, reason: `Evaluation failed: ${(err as Error).message}`, suggestion: 'Skip evaluation and retry or abort this round.' };
     }
 }

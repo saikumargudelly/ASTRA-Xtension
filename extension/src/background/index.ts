@@ -466,10 +466,19 @@ async function handleCommand(message: SubmitCommandMessage) {
                     })),
                 };
 
+                // FIX 2: Only capture a screenshot when: (a) it's round 0, or (b) the URL changed,
+                // or (c) the page content changed significantly (SPA navigation).
+                // Sending a 200-500KB base64 screenshot every round is the structural cause
+                // of 413 errors, excessive token usage, and rate-limit burnout.
+                // Unchanged pages need no vision re-analysis — the DOM snapshot is sufficient.
+                const shouldCaptureScreenshot = round === 0 || urlChanged || (pageContentChanged && round > 0);
+                const roundScreenshot = shouldCaptureScreenshot
+                    ? await captureScreenshot().catch(() => null)
+                    : null;
+                if (!shouldCaptureScreenshot) {
+                    console.log(`[ASTRA] Round ${round + 1}: skipping screenshot (URL and content unchanged)`);
+                }
                 const planRegion = inferRegionFromUrl(roundCtx.activeTab?.url);
-                // Capture a fresh screenshot for this round so the vision agent sees the
-                // current page state (first round + page transitions use it; other rounds skip).
-                const roundScreenshot = await captureScreenshot().catch(() => null);
                 const planRes = await fetch(`${BACKEND_URL}/plan-actions`, {
                     method: 'POST', headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({

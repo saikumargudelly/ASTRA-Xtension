@@ -155,6 +155,9 @@ export class ExecutionEngine {
   
   constructor(options: Partial<ExecutionOptions> = {}) {
     this.options = { ...DEFAULT_EXECUTION_OPTIONS, ...options };
+    // FIX 7: Scheduled context cleanup — prevents unbounded Map growth.
+    // Clean contexts older than 1 hour, run every 10 minutes.
+    setInterval(() => this.cleanup(3_600_000), 600_000).unref();
   }
   
   // ─── Event Handling ───
@@ -192,7 +195,9 @@ export class ExecutionEngine {
   ): ExecutionContext {
     const ctx: ExecutionContext = {
       executionId,
-      sessionId: `session_${Date.now()}`,
+      // FIX 8: crypto.randomUUID() for globally unique session IDs.
+      // Date.now() is not unique under concurrent requests in the same millisecond.
+      sessionId: `session_${crypto.randomUUID()}`,
       startTime: Date.now(),
       prompt,
       completedSteps: new Map(),
@@ -461,9 +466,9 @@ export class ExecutionEngine {
         const depsSatisfied = group.dependsOnGroups.every(depGroupId => {
           const depGroup = groups.find(g => g.groupId === depGroupId);
           if (!depGroup) return true;
-          return depGroup.steps.every(s => 
-            context.completedSteps.has(s.id) || context.failedSteps.has(s.id)
-          );
+          // FIX 9: A FAILED prerequisite step does NOT satisfy a dependency.
+          // Only successfully completed steps count as satisfied.
+          return depGroup.steps.every(s => context.completedSteps.has(s.id));
         });
         
         if (!depsSatisfied) {
