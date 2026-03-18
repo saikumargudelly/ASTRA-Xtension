@@ -8,8 +8,7 @@
 import { StreamEmitter } from '../llm/streaming.js';
 import { chatMessages } from '../services/llm.js';
 import { evaluate as criticEvaluate } from '../agents/critic.js';
-import { recall, workingSet, storeMemoryDirect } from '../agents/memory.js';
-import { getOrchestrator } from '../agents/orchestrator/index.js';
+import { storeMemoryDirect, queryMemoryDirect } from '../agents/memory.js';
 import { performWebResearch } from '../agents/webResearch.js';
 import type { LLMMessage } from '../types/index.js';
 
@@ -172,12 +171,10 @@ export class NexusCoordinator {
         let memoryContext = '';
         if (this.config.enableMemory) {
             try {
-                const memories = await recall(message, 6, sessionId);
-                const episodicItems = memories.episodic.map((m) => m.text).join('\n');
-                const semanticItems = memories.semantic.map((m) => m.text).join('\n');
-                memoryContext = [episodicItems, semanticItems].filter(Boolean).join('\n');
+                const memories = await queryMemoryDirect(message, 6);
+                memoryContext = memories.map((m) => m.text).join('\n');
                 if (memoryContext) {
-                    yield { type: 'thinking', text: `Found ${memories.episodic.length + memories.semantic.length} relevant memories` };
+                    yield { type: 'thinking', text: `Found ${memories.length} relevant memories` };
                 }
             } catch {
                 // Memory errors are non-fatal
@@ -280,46 +277,13 @@ export class NexusCoordinator {
             yield { type: 'action', agent: 'planner', action: 'plan_ready', params: { intent: plan.intent, steps: plan.steps.length } };
             yield { type: 'thinking', text: `Plan: ${plan.intent} (${plan.steps.length} steps)` };
 
-            // Wrap orchestrator in a short timeout — if no content script is connected
-            // (i.e. called from popup via /chat instead of background script), it will
-            // time out and we fall through to the LLM fallback below.
-            const orchestratorResult = await Promise.race([
-                (async () => {
-                    const orchestrator = getOrchestrator();
-                    return await orchestrator.orchestrate({
-                        plan,
-                        prompt: message,
-                        context: { sessionId, url: context?.url, title: context?.title },
-                    });
-                })(),
-                new Promise<null>((resolve) => setTimeout(() => resolve(null), 4000)),
-            ]);
-
-            if (
-                orchestratorResult &&
-                orchestratorResult.summary &&
-                orchestratorResult.summary.length > 100 &&
-                !orchestratorResult.summary.includes('completed successfully') &&
-                !orchestratorResult.summary.includes('Page analysis completed')
-            ) {
-                // ── Critic gate for browse/research results ──────────────────
-                if (this.config.enableCritic) {
-                    const score = await criticEvaluate(orchestratorResult.summary, message);
-                    if (score.overall < this.config.reflectionThreshold) {
-                        yield { type: 'thinking', text: `Quality score ${score.overall.toFixed(2)} — response may be incomplete.` };
-                    }
-                }
-                yield { type: 'token', text: orchestratorResult.summary };
-                yield { type: 'agent_done', agent: 'browser', durationMs: orchestratorResult.duration ?? 0 };
-                yield { type: 'done' };
-                return;
-            }
-
-            // Orchestrator timed out or returned empty/generic result (no content script)
+            // The legacy server-side orchestrator is removed. Since the chat endpoint
+            // doesn't have a direct Chrome content script connection, all browser/research
+            // tasks from chat will fall through to live web research.
             yield { type: 'thinking', text: 'Browser agent not available — running live web research...' };
         } catch (err) {
             yield { type: 'thinking', text: 'Browser agent unavailable — running live web research...' };
-            console.warn('[Coordinator] Browser orchestrator failed:', (err as Error).message);
+            console.warn('[Coordinator] Browser orchestrator fallback failed:', (err as Error).message);
         }
 
         // ── Live Web Research — grounded responses only, never synthetic ─────────
@@ -530,11 +494,8 @@ ${webGrounding}${sourceLine}`;
         switch (action) {
             case 'recall_memory': {
                 const query = String(params.query ?? '');
-                const memories = await recall(query, 5, sessionId);
-                const items = [
-                    ...memories.episodic.map((m) => m.text),
-                    ...memories.semantic.map((m) => m.text),
-                ];
+                const memories = await queryMemoryDirect(query, 5);
+                const items = memories.map((m) => m.text);
                 return items.length ? items.join('\n') : 'No relevant memories found.';
             }
 

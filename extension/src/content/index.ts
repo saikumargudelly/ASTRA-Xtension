@@ -2275,32 +2275,72 @@ async function handleDOMAction(message: ExecuteDOMActionMessage) {
 
         case 'type': {
             if (!selector) throw new Error('type requires a selector');
-            if (!value) throw new Error('type requires a value');
+            if (value === undefined || value === null) throw new Error('type requires a value');
             const el = safeQuerySelector(selector) as HTMLInputElement | HTMLTextAreaElement | null;
             if (!el) throw new Error(`Element not found: ${selector}`);
+            
             // ─── Visual cursor feedback ───
             await cursorFocusElement(el, `Typing "${value.substring(0, 20)}${value.length > 20 ? '...' : ''}"`);
+            
             el.focus();
             
+            // Clear existing value robustly (React-friendly)
             const nativeInputValueSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')?.set;
             const nativeTextAreaValueSetter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value')?.set;
-
+            const setter = el instanceof HTMLTextAreaElement ? nativeTextAreaValueSetter : nativeInputValueSetter;
+            
+            if (setter) {
+                setter.call(el, '');
+            } else {
+                el.value = '';
+            }
+            el.dispatchEvent(new Event('input', { bubbles: true, composed: true }));
+            el.dispatchEvent(new Event('change', { bubbles: true, composed: true }));
+            
+            // Type the new value character by character with full KeyboardEvent lifecycle
             let currentVal = '';
-            for (const char of value) {
+            const isSubmit = value.endsWith('\n') || value.endsWith('\\n');
+            const typeValue = isSubmit ? value.replace(/\\?n$/, '') : value;
+            
+            for (const char of typeValue) {
                 currentVal += char;
-                if (el instanceof HTMLTextAreaElement && nativeTextAreaValueSetter) {
-                    nativeTextAreaValueSetter.call(el, currentVal);
-                } else if (nativeInputValueSetter) {
-                    nativeInputValueSetter.call(el, currentVal);
+                
+                // Keydown
+                const keyOpts = { key: char, code: `Key${char.toUpperCase()}`, bubbles: true, cancelable: true, composed: true };
+                el.dispatchEvent(new KeyboardEvent('keydown', keyOpts));
+                el.dispatchEvent(new KeyboardEvent('keypress', keyOpts));
+                
+                // Set value
+                if (setter) {
+                    setter.call(el, currentVal);
                 } else {
                     el.value = currentVal;
                 }
+                
+                // Input & Keyup
                 el.dispatchEvent(new Event('input', { bubbles: true, composed: true }));
-                await sleep(18);
+                el.dispatchEvent(new KeyboardEvent('keyup', keyOpts));
+                
+                await sleep(15);
             }
+            
             el.dispatchEvent(new Event('change', { bubbles: true, composed: true }));
+            
+            // Auto-submit if value ends with a newline (just like browser-use does)
+            if (isSubmit) {
+                await sleep(100);
+                const enterOpts = { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true, cancelable: true, composed: true };
+                el.dispatchEvent(new KeyboardEvent('keydown', enterOpts));
+                el.dispatchEvent(new KeyboardEvent('keypress', enterOpts));
+                el.dispatchEvent(new KeyboardEvent('keyup', enterOpts));
+                // Optional: attempt form submission
+                if (el.form) {
+                    el.form.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true, composed: true }));
+                }
+            }
+            
             hideCursorFeedback();
-            return { success: true, data: { typed: value, into: selector } };
+            return { success: true, data: { typed: typeValue, into: selector } };
         }
 
         case 'scroll': {

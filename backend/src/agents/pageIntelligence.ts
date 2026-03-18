@@ -509,17 +509,14 @@ ACTION LINE RULES (strict):
 MULTI-STEP PATTERNS (you can output multiple actions per round):
 - SEARCH ON A SITE — CRITICAL RULES:
   ★ If a text-input or search-input is ALREADY VISIBLE in the element list:
-    → DO NOT click it first. Go straight to: action: type | elementIdx: N | value: <query>
-    → In the SAME round, IMMEDIATELY after the type action, add the submit:
-      action: press_enter | elementIdx: N | reason: Submit search
-      (press_enter sends Enter to the input — submits the form on any search bar)
-    → press_enter works on Flipkart, Amazon, Google and virtually every search bar on the web.
-    → ONLY use a click on a separate button if press_enter truly isn't expected to work.
+    → DO NOT click it first. Go straight to: action: type | elementIdx: N | value: <query>\n
+    → Notice the \\n at the end of the value. This automatically presses Enter after typing to submit the search.
+    → This is the most reliable way to search. NEVER use a separate click on a search button if you can just append \\n to the type value.
   ★ If ONLY a search ICON/BUTTON is visible (no text-input yet):
     → Click the icon first. The text-input will appear in the next round.
   ★ NEVER click a text-input/search-input element just to "focus" it — it wastes a round.
     The first action on a search input must always be 'type', not 'click'.
-- Fill form + submit: type into fields → then click submit button. These CAN be in the same round.
+- Fill form + submit: type into fields → then click submit button. These CAN be in the same round, or you can just use \\n on the last field.
 - Navigate menus: click menu → next round shows dropdown → click item. One step per round.
 
 IMPORTANT: Each round you only see the CURRENT page elements. If an element you need (like a search input)
