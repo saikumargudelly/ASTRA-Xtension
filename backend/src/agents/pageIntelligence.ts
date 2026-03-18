@@ -275,18 +275,29 @@ export async function planPageActions(
     // Fall back to all elements if filtering is too aggressive
     let elementsToUse = relevantElements.length >= 2 ? relevantElements : activePage.interactiveElements;
 
-    // ── Hard token cap: never send more than 55 elements to the LLM.
-    // Groq openai/gpt-oss-120b has 8k TPM; 138 elements × ~65 chars ≈ 9k tokens → 413.
-    // If we have too many, keep the 55 most actionable ones:
-    // priority 1: search / text inputs (highest utility for navigation tasks)
-    // priority 2: buttons and links
-    // priority 3: everything else (in original DOM order)
-    const ELEMENT_CAP = 55;
+    // ── Hard token cap
+    // Since we fixed the 413 screenshot payload issue, we can safely allow up to 120 elements.
+    // 120 elements * ~70 chars = ~8.4k chars ≈ 2k tokens, well within any modern LLM's 8k+ window.
+    const ELEMENT_CAP = 120;
     if (elementsToUse.length > ELEMENT_CAP) {
-        const p1 = elementsToUse.filter(el => ['text-input', 'search-input'].includes(el.type) || /search|query/i.test(el.label));
-        const p2 = elementsToUse.filter(el => !p1.includes(el) && ['button', 'link', 'image-button', 'custom-option'].includes(el.type));
-        const p3 = elementsToUse.filter(el => !p1.includes(el) && !p2.includes(el));
-        elementsToUse = [...p1, ...p2, ...p3].slice(0, ELEMENT_CAP);
+        // priority 0: elements matching the search query (highest priority!)
+        const queryTerms = intent.searchQuery ? intent.searchQuery.toLowerCase().trim().split(/\s+/) : [];
+        const p0 = elementsToUse.filter(el => 
+            queryTerms.length > 0 && queryTerms.every(term => 
+                el.label.toLowerCase().includes(term) || (el.context && el.context.toLowerCase().includes(term))
+            )
+        );
+        
+        // priority 1: search / text inputs
+        const p1 = elementsToUse.filter(el => !p0.includes(el) && (['text-input', 'search-input'].includes(el.type) || /search|query/i.test(el.label)));
+        
+        // priority 2: buttons and links
+        const p2 = elementsToUse.filter(el => !p0.includes(el) && !p1.includes(el) && ['button', 'link', 'image-button', 'custom-option'].includes(el.type));
+        
+        // priority 3: everything else (in original DOM order)
+        const p3 = elementsToUse.filter(el => !p0.includes(el) && !p1.includes(el) && !p2.includes(el));
+        
+        elementsToUse = [...p0, ...p1, ...p2, ...p3].slice(0, ELEMENT_CAP);
     }
 
     const elementList = elementsToUse.map(el =>
