@@ -5,7 +5,6 @@ import { performWebResearch } from '../agents/webResearch.js';
 import type { BrowserSnapshot } from '../agents/pageIntelligence.js';
 import { normalizeRegion, getRegionalUrl } from '../config/regionalUrls.js';
 import { isSafe } from '../agents/critic.js';
-import { workingGet, workingSet, recall } from '../agents/memory.js';
 import { classifyPageState, formatPageStateForPlanner } from '../agents/pageState.js';
 import { evaluateGoal } from '../agents/goalEvaluator.js';
 
@@ -60,35 +59,14 @@ export async function planActionsRoute(app: FastifyInstance) {
 
             let intent: ParsedIntent;
             if (isContinuation) {
-                // Try in-process cache first, then Redis working memory
-                const inProcess = planActionsIntentCache.get(cacheKey);
-                const fromMemory = inProcess ?? await workingGet<ParsedIntent>(`intent:${cacheKey}`, sessionId).catch(() => null);
-                intent = fromMemory ?? await parseUserIntent(query, plannerHint);
+                // Use in-process cache on continuation rounds — intent doesn't change mid-task
+                intent = planActionsIntentCache.get(cacheKey) ?? await parseUserIntent(query, plannerHint);
             } else {
                 intent = await parseUserIntent(query, plannerHint);
-                // Cache in-process and persist to working memory (1h TTL)
                 planActionsIntentCache.set(cacheKey, intent);
-                workingSet(`intent:${cacheKey}`, intent, sessionId, 3600).catch(() => { /* non-fatal */ });
             }
 
-            // ── Phase 1b: Memory recall ───────────────────────────────────────
-            // Recall similar past sessions so the planner can benefit from
-            // previously learned navigation patterns for this site/task.
-            // Non-blocking — failure doesn't break planning.
-            let memoryContext: string | undefined;
-            if (!isContinuation) {
-                try {
-                    const memories = await recall(query, 3, sessionId);
-                    const relevant = [
-                        ...memories.episodic.map(m => m.text),
-                        ...memories.semantic.map(m => m.text),
-                    ].filter(Boolean).slice(0, 3);
-                    if (relevant.length) {
-                        memoryContext = `PAST SESSION CONTEXT (similar tasks):\n${relevant.map(m => `- ${m}`).join('\n')}`;
-                        console.log(`[PlanActions] Memory: ${relevant.length} relevant past sessions recalled`);
-                    }
-                } catch { /* memory failure is non-fatal */ }
-            }
+
 
             // ── Phase 2: Web research ─────────────────────────────────────────
             const needsResearch = !isContinuation && (
@@ -122,10 +100,6 @@ export async function planActionsRoute(app: FastifyInstance) {
                 console.log(`[PlanActions] Skipping web research on continuation round (${executedActions!.length} prior actions)`);
             }
 
-            // Merge memory context into web context if available
-            if (memoryContext) {
-                webContext = webContext ? `${webContext}\n\n${memoryContext}` : memoryContext;
-            }
 
             // ── Phase 2b: Page State Classification ──────────────────────────
             // Classify what kind of interaction screen is currently visible
@@ -196,13 +170,6 @@ export async function planActionsRoute(app: FastifyInstance) {
             }
             actions = safeActions;
 
-            // ── Phase 6: Persist plan to working memory ───────────────────────
-            // Store the planned actions so future recall() calls can reference
-            // what ASTRA did for similar prior tasks.
-            if (actions.length > 0) {
-                const memText = `Task: "${query}" | Site: ${browserSnapshot.activeTab.url} | Actions: ${actions.map(a => a.label).join(' → ')}`;
-                workingSet(`plan:${Date.now()}`, memText, sessionId, 86400).catch(() => { /* non-fatal */ });
-            }
 
             const askAction = actions.find(a => a.action === 'ask_user');
 

@@ -2,12 +2,8 @@ import 'dotenv/config';
 import Fastify from 'fastify';
 import cors from '@fastify/cors';
 import { intentRoutes } from './routes/intent.js';
-import { executeRoutes } from './routes/execute.js';
-import { summarizeRoutes } from './routes/summarize.js';
-import { memoryRoutes } from './routes/memory.js';
 import { analyzeRoutes } from './routes/analyze.js';
 import { configRoutes } from './routes/config.js';
-import { orchestrateRoutes } from './routes/orchestrate.js';
 import { chatRoutes } from './routes/chat.js';
 import { planActionsRoute } from './routes/planActions.js';
 import { getDb, closeDb } from './db/sqlite.js';
@@ -52,16 +48,11 @@ async function start() {
         timestamp: new Date().toISOString(),
     }));
 
-    // ─── Routes (existing ASTRA — backward compatible) ───
+    // ─── Routes ───
     await app.register(intentRoutes);
-    await app.register(executeRoutes);
-    await app.register(summarizeRoutes);
-    await app.register(memoryRoutes);
     await app.register(analyzeRoutes);
     await app.register(configRoutes);
-    await app.register(orchestrateRoutes);
-
-    // ─── NEXUS New Routes ───
+    // ─── NEXUS Core Routes ───
     await app.register(chatRoutes);
     await app.register(planActionsRoute);
 
