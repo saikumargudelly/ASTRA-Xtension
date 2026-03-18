@@ -10,3 +10,10 @@ build/
 .vite/
 backend/astra.db-shm
 backend/astra.db-wal
+
+# Irrelevant development & debug documents
+ACTION-SYSTEM-REVIEW.md
+ROOT-CAUSE-ANALYSIS-FIX.md
+SYSTEM-ENHANCEMENTS-COMPLETE.md
+plans/
+.code-cli/
