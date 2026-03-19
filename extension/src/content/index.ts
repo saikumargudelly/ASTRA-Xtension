@@ -150,8 +150,132 @@ function safeValue(val: string): string {
     return val.slice(0, 2048);
 }
 
+interface AstraMicResponse {
+    success: boolean;
+    transcript?: string;
+    audioBase64?: string;
+    mimeType?: string;
+    filename?: string;
+    error?: string;
+    code?: string;
+}
+
+let astraMicRecorder: MediaRecorder | null = null;
+let astraMicStream: MediaStream | null = null;
+let astraMicChunks: BlobPart[] = [];
+
+function stopAstraMicTracks(): void {
+    astraMicStream?.getTracks().forEach((track) => track.stop());
+    astraMicStream = null;
+}
+
+function blobToBase64(blob: Blob): Promise<string> {
+    return new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => {
+            const result = typeof reader.result === 'string' ? reader.result : '';
+            const [, base64 = ''] = result.split(',');
+            resolve(base64);
+        };
+        reader.onerror = () => reject(reader.error || new Error('Failed to read audio blob'));
+        reader.readAsDataURL(blob);
+    });
+}
+
+async function startAstraMicCapture(): Promise<AstraMicResponse> {
+    if (astraMicRecorder && astraMicRecorder.state !== 'inactive') {
+        return { success: false, error: 'Microphone recording already in progress', code: 'ALREADY_RECORDING' };
+    }
+
+    try {
+        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        astraMicStream = stream;
+        astraMicChunks = [];
+
+        const mimeType = MediaRecorder.isTypeSupported('audio/webm') ? 'audio/webm' : undefined;
+        astraMicRecorder = mimeType ? new MediaRecorder(stream, { mimeType }) : new MediaRecorder(stream);
+
+        astraMicRecorder.ondataavailable = (event: BlobEvent) => {
+            if (event.data.size > 0) astraMicChunks.push(event.data);
+        };
+
+        astraMicRecorder.start();
+        return { success: true };
+    } catch (error) {
+        const err = error as DOMException;
+        if (err?.name === 'NotAllowedError' || err?.name === 'PermissionDeniedError') {
+            const message = err?.message?.trim()
+                ? `Microphone permission denied on this site: ${err.message}`
+                : 'Microphone permission denied on this site';
+            return { success: false, error: message, code: 'MIC_DENIED' };
+        }
+        const name = err?.name ? `${err.name}: ` : '';
+        const message = error instanceof Error
+            ? `${name}${error.message}`
+            : 'Unable to access microphone in active tab';
+        return { success: false, error: message, code: 'MIC_FAILED' };
+    }
+}
+
+function stopAstraMicCapture(): Promise<AstraMicResponse> {
+    const recorder = astraMicRecorder;
+    if (!recorder || recorder.state === 'inactive') {
+        return Promise.resolve({ success: false, error: 'No active microphone recording', code: 'NOT_RECORDING' });
+    }
+
+    return new Promise((resolve) => {
+        recorder.onstop = async () => {
+            try {
+                const mimeType = recorder.mimeType || 'audio/webm';
+                const audioBlob = new Blob(astraMicChunks, { type: mimeType });
+                astraMicChunks = [];
+                astraMicRecorder = null;
+                stopAstraMicTracks();
+
+                if (audioBlob.size === 0) {
+                    resolve({ success: false, error: 'No audio captured', code: 'EMPTY_AUDIO' });
+                    return;
+                }
+
+                const audioBase64 = await blobToBase64(audioBlob);
+                resolve({
+                    success: true,
+                    audioBase64,
+                    mimeType,
+                    filename: 'recording.webm',
+                });
+            } catch (error) {
+                const message = error instanceof Error ? error.message : 'Failed to encode recorded audio';
+                resolve({ success: false, error: message, code: 'MIC_STOP_ERROR' });
+            }
+        };
+
+        recorder.stop();
+    });
+}
+
 // ─── Message Listener ───
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+    if (message?.type === 'ASTRA_MIC_START') {
+        startAstraMicCapture()
+            .then((result) => sendResponse(result))
+            .catch((error) => {
+                const msg = error instanceof Error ? error.message : String(error);
+                sendResponse({ success: false, error: msg, code: 'MIC_START_ERROR' } satisfies AstraMicResponse);
+            });
+        return true;
+    }
+
+    if (message?.type === 'ASTRA_MIC_STOP') {
+        stopAstraMicCapture()
+            .then((result) => sendResponse(result))
+            .catch((error) => {
+                const msg = error instanceof Error ? error.message : String(error);
+                sendResponse({ success: false, error: msg, code: 'MIC_STOP_ERROR' } satisfies AstraMicResponse);
+            });
+        return true;
+    }
+
     if (message.type === 'EXECUTE_DOM_ACTION') {
         handleDOMAction(message as ExecuteDOMActionMessage)
             .then((result) => sendResponse(result))

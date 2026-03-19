@@ -8,6 +8,7 @@ import type {
     Walkthrough as WalkthroughType,
 } from '../types/messages';
 import { WalkthroughComponent } from './Walkthrough';
+import { useVoice } from '../hooks/useVoice';
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 type ViewMode = 'input' | 'running' | 'results' | 'walkthrough';
@@ -58,8 +59,10 @@ export function Popup() {
     const [followUp, setFollowUp] = useState<FollowUpState | null>(null);
     const [followUpInput, setFollowUpInput] = useState('');
     const [actionProgress, setActionProgress] = useState<Array<{ actionIndex: number; label: string; status: string; emoji?: string; result?: string }>>([]);
+    const [voiceUiError, setVoiceUiError] = useState<string | null>(null);
     const outputRef = useRef<HTMLDivElement>(null);
     const textareaRef = useRef<HTMLTextAreaElement>(null);
+    const queuedVoicePromptRef = useRef<string | null>(null);
 
     // ─── Health check on mount ───────────────────────────────────────────────
     useEffect(() => {
@@ -207,8 +210,10 @@ export function Popup() {
 
     // ─── Submit: ALL tasks go through background SW ──────────────────────────
     const handleSubmit = useCallback(() => {
-        const trimmed = prompt.trim();
+        const trimmed = (queuedVoicePromptRef.current ?? prompt).trim();
         if (!trimmed || viewMode === 'running') return;
+        queuedVoicePromptRef.current = null;
+        setPrompt(trimmed);
 
         chrome.storage.session.remove('astra_state');
         setSteps([]);
@@ -224,6 +229,29 @@ export function Popup() {
             payload: { prompt: trimmed, locale: navigator.language },
         });
     }, [prompt, viewMode]);
+
+    const handleVoiceTranscript = useCallback((text: string) => {
+        const transcript = text.trim();
+        if (!transcript) return;
+        queuedVoicePromptRef.current = transcript;
+        setPrompt(transcript);
+        handleSubmit();
+    }, [handleSubmit]);
+
+    const {
+        isRecording: isVoiceRecording,
+        isProcessing: isVoiceProcessing,
+        error: voiceError,
+        startRecording,
+        stopRecording,
+    } = useVoice(handleVoiceTranscript);
+
+    useEffect(() => {
+        if (!voiceError) return;
+        setVoiceUiError(voiceError);
+        const timer = window.setTimeout(() => setVoiceUiError(null), 3000);
+        return () => window.clearTimeout(timer);
+    }, [voiceError]);
 
     // ─── Submit follow-up response ──────────────────────────────────────────
     const sendFollowUpResponse = useCallback((answer: string) => {
@@ -258,6 +286,15 @@ export function Popup() {
     };
 
     const isRunning = viewMode === 'running';
+
+    const handleMicClick = useCallback(async () => {
+        if (isVoiceProcessing || isRunning) return;
+        if (isVoiceRecording) {
+            stopRecording();
+            return;
+        }
+        await startRecording();
+    }, [isVoiceProcessing, isRunning, isVoiceRecording, startRecording, stopRecording]);
 
     if (viewMode === 'walkthrough' && currentWalkthrough) {
         return (
@@ -313,22 +350,59 @@ export function Popup() {
                         rows={3}
                         className="w-full px-3 py-2.5 bg-astra-surface border border-astra-border rounded-xl text-sm text-astra-text placeholder-astra-text-muted resize-none outline-none transition-all duration-200 focus:border-violet-500 focus:shadow-[0_0_0_3px_rgba(139,92,246,0.15)] disabled:opacity-50 font-sans"
                     />
-                    <button
-                        onClick={handleSubmit}
-                        disabled={!prompt.trim() || isRunning}
-                        className="absolute bottom-2.5 right-2.5 px-3 py-1.5 bg-gradient-to-r from-violet-600 to-indigo-500 text-white text-xs font-medium rounded-lg transition-all duration-200 hover:shadow-[0_0_12px_rgba(139,92,246,0.5)] hover:scale-[1.02] active:scale-[0.98] disabled:opacity-40 disabled:cursor-not-allowed disabled:hover:shadow-none disabled:hover:scale-100"
-                    >
-                        {isRunning ? (
+                    <div className="absolute bottom-2.5 right-2.5 flex items-center gap-1.5">
+                        <button
+                            onClick={handleMicClick}
+                            disabled={isVoiceProcessing || isRunning}
+                            title="Click to speak your command"
+                            className={`px-2 py-1.5 rounded-lg border transition-all duration-200 active:scale-[0.98] ${isVoiceRecording
+                                ? 'border-red-500/60 bg-red-500/15 text-red-300'
+                                : 'border-astra-border bg-astra-surface text-astra-text-muted hover:text-astra-text hover:border-violet-500/50'} disabled:opacity-40 disabled:cursor-not-allowed`}
+                        >
                             <span className="flex items-center gap-1.5">
+                                <svg className="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+                                    <path d="M12 4a3 3 0 00-3 3v5a3 3 0 006 0V7a3 3 0 00-3-3z" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" />
+                                    <path d="M19 11a7 7 0 01-14 0" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" />
+                                    <path d="M12 18v3" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" />
+                                </svg>
+                                {isVoiceRecording && (
+                                    <span className="inline-flex items-center gap-1 text-[10px] font-medium">
+                                        <span className="w-1.5 h-1.5 bg-red-500 rounded-full animate-pulse" />
+                                        Stop
+                                    </span>
+                                )}
+                            </span>
+                        </button>
+
+                        {isVoiceProcessing && (
+                            <span className="inline-flex items-center text-violet-300" aria-label="Processing voice command">
                                 <svg className="w-3 h-3 animate-spin" viewBox="0 0 24 24" fill="none">
                                     <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="3" />
                                     <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
                                 </svg>
-                                Running
                             </span>
-                        ) : 'Run ⏎'}
-                    </button>
+                        )}
+
+                        <button
+                            onClick={handleSubmit}
+                            disabled={!prompt.trim() || isRunning}
+                            className="px-3 py-1.5 bg-gradient-to-r from-violet-600 to-indigo-500 text-white text-xs font-medium rounded-lg transition-all duration-200 hover:shadow-[0_0_12px_rgba(139,92,246,0.5)] hover:scale-[1.02] active:scale-[0.98] disabled:opacity-40 disabled:cursor-not-allowed disabled:hover:shadow-none disabled:hover:scale-100"
+                        >
+                            {isRunning ? (
+                                <span className="flex items-center gap-1.5">
+                                    <svg className="w-3 h-3 animate-spin" viewBox="0 0 24 24" fill="none">
+                                        <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="3" />
+                                        <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
+                                    </svg>
+                                    Running
+                                </span>
+                            ) : 'Run ⏎'}
+                        </button>
+                    </div>
                 </div>
+                {voiceUiError && (
+                    <p className="mt-2 text-[11px] text-red-400">{voiceUiError}</p>
+                )}
             </div>
 
             {/* ── Output Panel ─────────────────────────────────────────────────── */}

@@ -6,6 +6,7 @@ import { analyzeRoutes } from './routes/analyze.js';
 import { configRoutes } from './routes/config.js';
 import { chatRoutes } from './routes/chat.js';
 import { planActionsRoute } from './routes/planActions.js';
+import { sttRoutes } from './routes/stt.js';
 import { getDb, closeDb } from './db/sqlite.js';
 import { closeRedis } from './db/redis.js';
 import { closePostgres, migrateSchema } from './db/postgres.js';
@@ -57,6 +58,7 @@ async function start() {
     // ─── NEXUS Core Routes ───
     await app.register(chatRoutes);
     await app.register(planActionsRoute);
+    await app.register(sttRoutes);
 
     // ─── Initialize Databases ───
     // SQLite (existing — always available)

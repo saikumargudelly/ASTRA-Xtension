@@ -142,6 +142,13 @@ CHROMA_URL=http://localhost:8000
 PRIVACY_MODE=cloud
 ```
 
+### STT Setup (Voice Input)
+
+- Get a free Groq API key at [console.groq.com](https://console.groq.com) (no card required)
+- Add `GROQ_API_KEY` to `backend/.env`
+- Optional: set `GROQ_WHISPER_MODEL=whisper-large-v3-turbo`
+- Open the extension popup, click the mic button, and speak your command
+
 ---
 
 ## System Architecture
